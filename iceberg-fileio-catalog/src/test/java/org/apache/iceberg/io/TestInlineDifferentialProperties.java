@@ -48,6 +48,9 @@ import org.apache.iceberg.catalog.Namespace;
  * differ between the two runs, so snapshots are compared by position and manifests by content.
  * Once the wall clock steps during a try, the metadata-table columns Iceberg derives from the
  * order of timestamps ({@link ClockSteps#CLOCK_ORDERED}) are not compared for the rest of it.
+ *
+ * <p>A paged catalog reads like one that never pages, the same way ({@link
+ * #aPagedCatalogReadsLikeOneThatNeverPages}).
  */
 class TestInlineDifferentialProperties {
 
@@ -84,7 +87,7 @@ class TestInlineDifferentialProperties {
         new TableScript.Runner(inline,
             otherMode.catalog(inlineIo, WAREHOUSE, "c", properties(maxUpdateSize, otherGzip)),
             formatVersion, partitioned, trace);
-    compare(pointerIo, inlineIo, trace, clockStepped(clock, trace));
+    compare(pointerIo, inlineIo, POINTER, trace, clockStepped(clock, trace));
     for (List<TableScript.Cmd> step : TableScript.steps(schedule)) {
       RuntimeException pointerRejected = p.run(step);
       clock.stepped();
@@ -99,13 +102,119 @@ class TestInlineDifferentialProperties {
       }
       Statistics.label("step")
           .collect(step.get(0).kind + (pointerRejected == null ? "" : " rejected"));
-      compare(pointerIo, inlineIo, trace, clockStepped(clock, trace));
+      compare(pointerIo, inlineIo, POINTER, trace, clockStepped(clock, trace));
     }
     Statistics.label("wall clock")
         .collect(clock.stepped() ? "stepped: clock-ordered columns not compared" : "steady");
     // Every catalog file either catalog wrote conforms to catalog.proto and survives a checkpoint.
     CheckpointRoundTrip.assertEveryWrite(pointerIo);
     CheckpointRoundTrip.assertEveryWrite(inlineIo);
+  }
+
+  /** The arms of {@link #inlineCatalogReadsLikeAPointerCatalog}, as {@link #compare} names them. */
+  private static final String[] POINTER = {"pointer", "inline"};
+
+  /** The arms of {@link #aPagedCatalogReadsLikeOneThatNeverPages}. */
+  private static final String[] PAGED = {"unpaged", "paged"};
+
+  /**
+   * The snapshot paging the paged arm draws, block and window: every snapshot behind the newest
+   * sealed at once (1, 0), and blocks that seal one, two or three commits behind.
+   */
+  private static final int[][] PAGINGS = {{1, 0}, {1, 1}, {2, 1}, {3, 2}};
+
+  /**
+   * A paged catalog reads like a catalog that never pages (SNAPSHOT_PAGING.md, "Testing"). A
+   * generated schedule runs on two catalogs alike but for snapshot paging, in an inline mode with
+   * its stale handles from a second catalog as above: one pages at a drawn block and window,
+   * whatever the run's {@code fileio.catalog.test.snapshot.block}, the reference never does. Each
+   * step must end alike in both, and the tables read the same after it ({@link #compare}, the
+   * paged table also as a worker reads it, from its pages). The reference's replay checks each
+   * delta against the builder, which replay skips on a table with sealed blocks. Iceberg's
+   * producers refresh before they commit, so a record that needs a sealed snapshot it lacks is
+   * rare here; {@link TestRebaseProperties} compares the admission of one that lands behind a
+   * window, paged and not.
+   */
+  @Property(tries = 200)
+  void aPagedCatalogReadsLikeOneThatNeverPages(
+      @ForAll @IntRange(min = 2, max = 3) int formatVersion,
+      @ForAll boolean partitioned,
+      @ForAll("inlineModes") LocalCatalogMode mode,
+      @ForAll("maxUpdateSizes") int maxUpdateSize,
+      @ForAll boolean gzip,
+      @ForAll("otherModes") LocalCatalogMode otherMode,
+      @ForAll boolean otherGzip,
+      @ForAll @IntRange(min = 0, max = 3) int pagingIndex,
+      @ForAll("schedules") List<TableScript.Cmd> schedule) {
+    int block = PAGINGS[pagingIndex][0];
+    int window = PAGINGS[pagingIndex][1];
+    ClockSteps clock = new ClockSteps();
+    InMemoryAtomicFileIO referenceIo = new InMemoryAtomicFileIO();
+    InMemoryAtomicFileIO pagedIo = new InMemoryAtomicFileIO();
+    LogCatalog reference = mode.catalog(
+        referenceIo, WAREHOUSE, "c", paging(properties(maxUpdateSize, gzip), 0, 0));
+    LogCatalog paged = mode.catalog(
+        pagedIo, WAREHOUSE, "c", paging(properties(maxUpdateSize, gzip), block, window));
+    reference.createNamespace(Namespace.of("ns"));
+    paged.createNamespace(Namespace.of("ns"));
+    StringBuilder trace =
+        new StringBuilder(String.format(
+            "v%d %s, %s, max update size %d, %s codec, paged at block %d, window %d; stale handles"
+                + " from %s, %s codec%n",
+            formatVersion, partitioned ? "partitioned" : "unpartitioned", mode, maxUpdateSize,
+            gzip ? "gzip" : "structural", block, window, otherMode,
+            otherGzip ? "gzip" : "structural"));
+    LogCatalog referenceOther = otherMode.catalog(
+        referenceIo, WAREHOUSE, "c", paging(properties(maxUpdateSize, otherGzip), 0, 0));
+    LogCatalog pagedOther = otherMode.catalog(
+        pagedIo, WAREHOUSE, "c", paging(properties(maxUpdateSize, otherGzip), block, window));
+    TableScript.Runner r = new TableScript.Runner(
+        reference, referenceOther, formatVersion, partitioned, new StringBuilder());
+    TableScript.Runner p =
+        new TableScript.Runner(paged, pagedOther, formatVersion, partitioned, trace);
+    compare(referenceIo, pagedIo, PAGED, trace, clockStepped(clock, trace));
+    int sealed = 0;
+    for (List<TableScript.Cmd> step : TableScript.steps(schedule)) {
+      RuntimeException referenceRejected = r.run(step);
+      clock.stepped();
+      RuntimeException pagedRejected = p.run(step);
+      if ((referenceRejected == null) != (pagedRejected == null)
+          || (referenceRejected != null
+              && referenceRejected.getClass() != pagedRejected.getClass())) {
+        throw new AssertionError(String.format(
+            "the step %s in the unpaged catalog and %s in the paged one%ntrace:%n%s",
+            referenceRejected == null ? "committed" : "was rejected (" + referenceRejected + ")",
+            pagedRejected == null ? "committed" : "was rejected (" + pagedRejected + ")",
+            trace));
+      }
+      sealed = Math.max(sealed, sealedBlocks(pagedIo));
+      compare(referenceIo, pagedIo, PAGED, trace, clockStepped(clock, trace));
+    }
+    Statistics.label("paging").collect("block " + block + ", window " + window);
+    Statistics.label("most sealed blocks of a table").collect(Math.min(sealed, 4));
+    CheckpointRoundTrip.assertEveryWrite(referenceIo);
+    CheckpointRoundTrip.assertEveryWrite(pagedIo);
+  }
+
+  private static Map<String, String> paging(Map<String, String> properties, int block, int window) {
+    Map<String, String> paged = new java.util.HashMap<>(properties);
+    paged.put(LogCatalogProperties.SNAPSHOT_BLOCK, String.valueOf(block));
+    paged.put(LogCatalogProperties.SNAPSHOT_WINDOW, String.valueOf(window));
+    return paged;
+  }
+
+  /** The most blocks the newest catalog in {@code io} seals of one of the script's tables. */
+  private static int sealedBlocks(InMemoryAtomicFileIO io) {
+    CatalogState state =
+        LocalCatalogMode.APPEND.catalog(io, WAREHOUSE, "c", Map.of()).log().read().state();
+    int most = 0;
+    for (org.apache.iceberg.catalog.TableIdentifier id :
+        List.of(TableScript.ID, TableScript.OTHER)) {
+      if (state.isInlineTable(id)) {
+        most = Math.max(most, state.sealedBlocks(state.tableId(id)).size());
+      }
+    }
+    return most;
   }
 
   @Provide
@@ -157,12 +266,13 @@ class TestInlineDifferentialProperties {
 
   /**
    * Reads the tables from each storage with a fresh pointer-mode reader and compares, all but the
-   * clock-ordered metadata columns if the wall clock has stepped; and the inline catalog's table
+   * clock-ordered metadata columns if the wall clock has stepped; and the second arm's table
    * with what a worker reads of it, sent by SerializableTable (by Java serialization and by Kryo).
+   * {@code arms} names the two in a difference.
    */
   private static void compare(
-      InMemoryAtomicFileIO pointerIo, InMemoryAtomicFileIO inlineIo, StringBuilder trace,
-      boolean clockStepped) {
+      InMemoryAtomicFileIO pointerIo, InMemoryAtomicFileIO inlineIo, String[] arms,
+      StringBuilder trace, boolean clockStepped) {
     LogCatalog pointerReader =
         LocalCatalogMode.APPEND.catalog(pointerIo, WAREHOUSE, "c", Map.of());
     LogCatalog inlineReader =
@@ -194,8 +304,8 @@ class TestInlineDifferentialProperties {
     keys.addAll(actual.keySet());
     for (String key : keys) {
       if (!java.util.Objects.equals(expected.get(key), actual.get(key))) {
-        differences.add(String.format("%s:%n    pointer: %s%n    inline:  %s",
-            key, expected.get(key), actual.get(key)));
+        differences.add(String.format("%s:%n    %-8s %s%n    %-8s %s",
+            key, arms[0] + ":", expected.get(key), arms[1] + ":", actual.get(key)));
       }
     }
     String stored =
@@ -203,7 +313,7 @@ class TestInlineDifferentialProperties {
     Statistics.label("inline table stored")
         .collect(stored != null && stored.startsWith("inline://") ? "inline" : "metadata file");
     if (!differences.isEmpty()) {
-      throw new AssertionError("the inline catalog reads differently:\n  "
+      throw new AssertionError("the " + arms[1] + " catalog reads differently:\n  "
           + String.join("\n  ", differences.subList(0, Math.min(4, differences.size())))
           + "\ntrace:\n" + trace);
     }

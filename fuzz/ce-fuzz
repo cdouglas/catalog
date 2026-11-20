@@ -68,7 +68,7 @@ SRC=/work/src
 T=iceberg-fileio-catalog/src/test/java/org/apache/iceberg/io
 HEAP=${HEAP:-4g}
 SHRINKING=${SHRINKING:-OFF}
-SHARDS=${SHARDS:-"azure=12 race=6 rebase=8 faultA2=6 mw=4 faultB2=4 diff=4 faultA1=3 faultB1=2 proto=2 contract=2"}
+SHARDS=${SHARDS:-"azure=12 race=6 rebase=11 faultA2=6 mw=4 faultB2=4 diff=6 faultA1=3 faultB1=2 proto=2 contract=2"}
 
 # die <message>: to stderr, and to the run's summary once it has one (a container's log is
 # gone with the container)
@@ -270,7 +270,7 @@ setup() {
       tries $2/$T/TestRebaseProperties.java "${r[@]}" ;;
     contract) tries $2/$T/ConflictEncodingContract.java each 2000 ;;
     diff)
-      tries $2/$T/TestInlineDifferentialProperties.java 3500
+      tries $2/$T/TestInlineDifferentialProperties.java 3500 2000
       tries $2/$T/TestInlineDeltaProperties.java 15000 ;;
     test) ;; # tries as written
   esac

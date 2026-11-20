@@ -81,6 +81,11 @@ import org.apache.iceberg.io.InMemoryAtomicFileIO.Fault;
  * admitted records. Under the Lamport clock the subject is a reference too, which sets the
  * baseline.
  *
+ * <p>In half the tries, each property but the reads oracle runs its subject without snapshot
+ * paging beside a twin paged at a drawn block and window (SNAPSHOT_PAGING.md, "Testing"): the
+ * twin must end as its own reference does, and admit R's record as the subject does, but where
+ * it needs a snapshot the window sealed ({@link #admission}).
+ *
  * <p>{@link #aMergedAppendIsWhatItsRetryWouldCommit} probes the merge ({@link Landing}) on its own:
  * its subject admits every delta that can be finalized where it lands ({@link
  * AdmitDeltasEncoding}), and R is an append that validates nothing, whose retry commits on any
@@ -125,9 +130,10 @@ class TestRebaseProperties {
       @ForAll("prefixes") List<TableScript.Cmd> prefix,
       @ForAll("windows") List<TableScript.Cmd> window,
       @ForAll("operations") TableScript.Cmd r,
-      @ForAll boolean merging) {
-    check(encoding, formatVersion, partitioned, mode, pinned, merging, List.of(), prefix, window,
-        r);
+      @ForAll boolean merging,
+      @ForAll("twins") int twin) {
+    check(twin, encoding, formatVersion, partitioned, mode, pinned, merging, List.of(), prefix,
+        window, r);
   }
 
   @Property(tries = 300)
@@ -138,8 +144,9 @@ class TestRebaseProperties {
       @ForAll("prefixes") List<TableScript.Cmd> prefix,
       @ForAll("windows") List<TableScript.Cmd> window,
       @ForAll("appends") TableScript.Cmd r,
-      @ForAll boolean merging) {
-    check(AdmitDeltasEncoding.register(), formatVersion, partitioned, mode, true, merging,
+      @ForAll boolean merging,
+      @ForAll("twins") int twin) {
+    check(twin, AdmitDeltasEncoding.register(), formatVersion, partitioned, mode, true, merging,
         List.of(), prefix, window, r);
   }
 
@@ -157,9 +164,10 @@ class TestRebaseProperties {
       @ForAll("upgrades") List<TableScript.Cmd> prefix,
       @ForAll("upgradeWindows") List<TableScript.Cmd> window,
       @ForAll("appends") TableScript.Cmd r,
-      @ForAll boolean merging) {
-    check(AdmitDeltasEncoding.register(), 2, partitioned, mode, true, merging, List.of(), prefix,
-        window, r);
+      @ForAll boolean merging,
+      @ForAll("twins") int twin) {
+    check(twin, AdmitDeltasEncoding.register(), 2, partitioned, mode, true, merging, List.of(),
+        prefix, window, r);
   }
 
   /**
@@ -174,9 +182,10 @@ class TestRebaseProperties {
       @ForAll("prefixes") List<TableScript.Cmd> prefix,
       @ForAll("appendWindows") List<TableScript.Cmd> window,
       @ForAll("appendLike") TableScript.Cmd r,
-      @ForAll boolean merging) {
-    check(BlindAppendEncoding.NAME, formatVersion, partitioned, mode, true, merging, List.of(),
-        prefix, window, r);
+      @ForAll boolean merging,
+      @ForAll("twins") int twin) {
+    check(twin, BlindAppendEncoding.NAME, formatVersion, partitioned, mode, true, merging,
+        List.of(), prefix, window, r);
   }
 
   /**
@@ -195,8 +204,9 @@ class TestRebaseProperties {
       @ForAll("inlineManifestModes") LocalCatalogMode mode,
       @ForAll("prefixes") List<TableScript.Cmd> prefix,
       @ForAll("validatedRaces") Race race,
-      @ForAll boolean merging) {
-    check(encoding, formatVersion, partitioned, mode, true, merging, race.writers(), prefix,
+      @ForAll boolean merging,
+      @ForAll("twins") int twin) {
+    check(twin, encoding, formatVersion, partitioned, mode, true, merging, race.writers(), prefix,
         race.window(), race.r());
   }
 
@@ -216,8 +226,10 @@ class TestRebaseProperties {
       @ForAll("guardPrefixes") List<TableScript.Cmd> prefix,
       @ForAll("guardWindows") List<TableScript.Cmd> window,
       @ForAll("guarded") TableScript.Cmd r,
-      @ForAll boolean merging) {
-    check(encoding, formatVersion, partitioned, mode, true, merging, List.of(), prefix, window, r);
+      @ForAll boolean merging,
+      @ForAll("twins") int twin) {
+    check(twin, encoding, formatVersion, partitioned, mode, true, merging, List.of(), prefix,
+        window, r);
   }
 
   /**
@@ -234,8 +246,9 @@ class TestRebaseProperties {
       @ForAll("keptHeads") List<TableScript.Cmd> prefix,
       @ForAll("expiredHistories") List<TableScript.Cmd> window,
       @ForAll("validatingFromTheHead") TableScript.Cmd r,
-      @ForAll boolean merging) {
-    check(encoding, formatVersion, true, mode, true, merging, List.of(), prefix, window, r);
+      @ForAll boolean merging,
+      @ForAll("twins") int twin) {
+    check(twin, encoding, formatVersion, true, mode, true, merging, List.of(), prefix, window, r);
   }
 
   /**
@@ -256,9 +269,10 @@ class TestRebaseProperties {
       @ForAll("guardPrefixes") List<TableScript.Cmd> prefix,
       @ForAll("expiryWindows") List<TableScript.Cmd> window,
       @ForAll("expiries") TableScript.Cmd r,
-      @ForAll boolean merging) {
-    check(encoding, formatVersion, partitioned, mode, pinned, merging, List.of(), prefix, window,
-        r);
+      @ForAll boolean merging,
+      @ForAll("twins") int twin) {
+    check(twin, encoding, formatVersion, partitioned, mode, pinned, merging, List.of(), prefix,
+        window, r);
   }
 
   /**
@@ -275,8 +289,9 @@ class TestRebaseProperties {
       @ForAll @IntRange(min = 2, max = 3) int formatVersion,
       @ForAll("inlineManifestModes") LocalCatalogMode mode,
       @ForAll("removals") List<List<TableScript.Cmd>> sample,
-      @ForAll boolean merging) {
-    check(encoding, formatVersion, true, mode, true, merging, List.of(), sample.get(0),
+      @ForAll boolean merging,
+      @ForAll("twins") int twin) {
+    check(twin, encoding, formatVersion, true, mode, true, merging, List.of(), sample.get(0),
         sample.get(1), sample.get(2).get(0));
   }
 
@@ -566,6 +581,7 @@ class TestRebaseProperties {
   }
 
   private static void check(
+      int twin,
       String encoding,
       int formatVersion,
       boolean partitioned,
@@ -577,9 +593,12 @@ class TestRebaseProperties {
       List<TableScript.Cmd> window,
       TableScript.Cmd r) {
     String[] outcome = verify(encoding, formatVersion, partitioned, mode, pinned, merging, writers,
-        prefix, window, r);
+        prefix, window, r, TWINS[twin]);
     Statistics.label("R on a raced table")
         .collect(pinned ? encoding : encoding + ", unpinned", outcome[0]);
+    if (outcome[3] != null) {
+      Statistics.label("R's record unpaged and paged").collect(outcome[3]);
+    }
     Statistics.label("R").collect(outcome[1]);
     Statistics.label("manifests").collect(outcome[2]);
     if (!writers.isEmpty()) {
@@ -620,19 +639,7 @@ class TestRebaseProperties {
         window, r);
   }
 
-  /**
-   * One try: R on the table the prefix built, the window run just before its first write, in the
-   * subject, whose writer pins what Iceberg commits once if {@code pinned}, and in the reference.
-   * If {@code merging}, the table merges manifests ({@code commit.manifest.min-count-to-merge} 2,
-   * so a merging producer rewrites its branch's manifests into one with its own, whose older
-   * entries keep their sequence numbers and row ids), and data commands add one to three files
-   * ({@link TableScript.Runner#severalFiles}), so a commit that removes one rewrites a manifest
-   * that keeps the others. The window's steps commit through writers in the modes {@code
-   * writers} names, step by step (the last for the steps after it; R's {@code mode} if none):
-   * writers that store a table otherwise than R's (C1 (list-file snapshots stamp nothing)). Returns
-   * how R's record went in the subject, R's kind (with " failed" if it failed), and whether it
-   * merged and wrote a manifest of older files.
-   */
+  /** One try ({@code verify} with {@code twin}), with no paged twin. */
   static String[] verify(
       String encoding,
       int formatVersion,
@@ -644,22 +651,72 @@ class TestRebaseProperties {
       List<TableScript.Cmd> prefix,
       List<TableScript.Cmd> window,
       TableScript.Cmd r) {
+    return verify(encoding, formatVersion, partitioned, mode, pinned, merging, writers, prefix,
+        window, r, null);
+  }
+
+  /**
+   * One try: R on the table the prefix built, the window run just before its first write, in the
+   * subject, whose writer pins what Iceberg commits once if {@code pinned}, and in the reference.
+   * If {@code merging}, the table merges manifests ({@code commit.manifest.min-count-to-merge} 2,
+   * so a merging producer rewrites its branch's manifests into one with its own, whose older
+   * entries keep their sequence numbers and row ids), and data commands add one to three files
+   * ({@link TableScript.Runner#severalFiles}), so a commit that removes one rewrites a manifest
+   * that keeps the others. The window's steps commit through writers in the modes {@code
+   * writers} names, step by step (the last for the steps after it; R's {@code mode} if none):
+   * writers that store a table otherwise than R's (C1 (list-file snapshots stamp nothing)).
+   *
+   * <p>With a {@code twin} (block and window), the subject never pages, and a twin of it pages its
+   * snapshots so: R's record must be admitted alike in both but where paging may tell them apart
+   * ({@link #admission}), and the twin must end as its reference does, with the same table.
+   *
+   * <p>Returns how R's record went in the subject, R's kind (with " failed" if it failed), whether
+   * it merged and wrote a manifest of older files, and how it went in the subject and its twin (or
+   * null with no twin).
+   */
+  static String[] verify(
+      String encoding,
+      int formatVersion,
+      boolean partitioned,
+      LocalCatalogMode mode,
+      boolean pinned,
+      boolean merging,
+      List<LocalCatalogMode> writers,
+      List<TableScript.Cmd> prefix,
+      List<TableScript.Cmd> window,
+      TableScript.Cmd r,
+      int[] twin) {
     StringBuilder trace = new StringBuilder(String.format(
-        "v%d %s, %s, %s%s%s%nprefix %s%nwindow %s%s%nR %s%n", formatVersion,
+        "v%d %s, %s, %s%s%s%s%nprefix %s%nwindow %s%s%nR %s%n", formatVersion,
         partitioned ? "partitioned" : "unpartitioned", mode, encoding,
         pinned ? "" : ", R's writer leaves commit-once unpinned",
-        merging ? ", merging manifests of several files" : "", prefix, window,
-        writers.isEmpty() ? "" : " by " + writers, r));
+        merging ? ", merging manifests of several files" : "",
+        twin == null ? ""
+            : String.format(
+                ", unpaged, with a twin paged at block %d, window %d", twin[0], twin[1]),
+        prefix, window, writers.isEmpty() ? "" : " by " + writers, r));
     Run subject = Run.of(encoding, mode, formatVersion, partitioned, pinned, merging, writers,
-        prefix, window, r, trace);
-    Run reference = Run.of(LamportEncoding.NAME, mode, formatVersion, partitioned, true, merging,
-        writers, prefix, window, r, new StringBuilder());
-    if (r.kind == TableScript.Kind.EXPIRE_SNAPSHOTS && subject.raced && subject.changed
-        && subject.conflicts == 0 && subject.failure == null) {
-      // merged where it landed: the window, then what R chose on the prefix's table, removed
-      reference = Run.expiryReference(mode, formatVersion, partitioned, merging, writers, prefix,
-          window, r, trace);
-    }
+        prefix, window, r, trace, twin == null ? Map.of() : paging(0, 0));
+    StringBuilder twinTrace = new StringBuilder();
+    Run paged = twin == null ? null
+        : Run.of(encoding, mode, formatVersion, partitioned, pinned, merging, writers, prefix,
+            window, r, twinTrace, paging(twin[0], twin[1]));
+    Run retried = Run.of(LamportEncoding.NAME, mode, formatVersion, partitioned, true, merging,
+        writers, prefix, window, r, new StringBuilder(), Map.of());
+    // An expiry merged where it landed: the window, then what R chose on the prefix's table,
+    // removed
+    Run[] expiry = {null};
+    java.util.function.Function<Run, Run> referenceOf = run -> {
+      if (r.kind != TableScript.Kind.EXPIRE_SNAPSHOTS || !run.raced || !run.changed
+          || run.conflicts > 0 || run.failure != null) {
+        return retried;
+      }
+      if (expiry[0] == null) {
+        expiry[0] = Run.expiryReference(mode, formatVersion, partitioned, merging, writers, prefix,
+            window, r, trace);
+      }
+      return expiry[0];
+    };
 
     String outcome;
     if (!subject.raced) {
@@ -668,13 +725,6 @@ class TestRebaseProperties {
       outcome = "window left the table as R read it";
     } else if (subject.conflicts == 0 && subject.failure == null) {
       outcome = "admitted on a changed table";
-      if (reference.failure != null) {
-        throw new AssertionError(String.format(
-            "the subject admitted R on a changed table, but %s fails it: %s%n%s",
-            r.kind == TableScript.Kind.EXPIRE_SNAPSHOTS
-                ? "the removal of what it chose, after the window," : "Iceberg's retry",
-            reference.failure, trace));
-      }
     } else if (subject.conflicts > 0 && subject.failure == null) {
       outcome = "conflict, repaired by the retry (false positive)";
     } else if (subject.conflicts > 0
@@ -688,28 +738,107 @@ class TestRebaseProperties {
       outcome = "failed without a conflict (" + subject.failure.getClass().getSimpleName() + ")";
     }
 
-    // Both runs end alike: what the subject admitted is what the retry committed, and what it
-    // failed the retry fails as
-    if ((subject.failure == null) != (reference.failure == null)
-        || (subject.failure != null
-            && subject.failure.getClass() != reference.failure.getClass())) {
-      throw new AssertionError(String.format(
-          "R %s in the subject but %s in the reference%n%s",
-          subject.failure == null ? "committed" : "failed (" + subject.failure + ")",
-          reference.failure == null ? "committed" : "failed (" + reference.failure + ")", trace));
-    }
-    List<String> differences =
-        TableViews.differences(reference.view, subject.view, "reference", "subject");
-    if (!differences.isEmpty()) {
-      throw new AssertionError("the subject's table differs from the reference's:\n  "
-          + String.join("\n  ", differences.subList(0, Math.min(4, differences.size())))
-          + "\n" + trace);
-    }
+    endsAsItsReference("subject", subject, referenceOf.apply(subject), r, trace.toString());
     CheckpointRoundTrip.assertEveryWrite(subject.io);
+    String admission = null;
+    if (paged != null) {
+      String both = trace + "the paged twin:\n" + twinTrace;
+      admission = admission(subject, paged, both);
+      endsAsItsReference("paged twin", paged, referenceOf.apply(paged), r, both);
+      CheckpointRoundTrip.assertEveryWrite(paged.io);
+    }
     return new String[] {outcome, r.kind + (subject.failure == null ? "" : " failed"),
         !merging ? "not merging"
             : subject.keptOlderFiles ? "merging, R wrote a manifest of older files"
-                : "merging, R wrote no manifest of older files"};
+                : "merging, R wrote no manifest of older files",
+        admission};
+  }
+
+  /**
+   * Checks that {@code run} ends as {@code reference} does: what it admitted on a changed table is
+   * what Iceberg's retry committed (or, for an expiry, the removal of what it chose), and what it
+   * failed the reference fails as; and that the two tables read alike.
+   */
+  private static void endsAsItsReference(
+      String name, Run run, Run reference, TableScript.Cmd r, String trace) {
+    if (run.raced && run.changed && run.conflicts == 0 && run.failure == null
+        && reference.failure != null) {
+      throw new AssertionError(String.format(
+          "the %s admitted R on a changed table, but %s fails it: %s%n%s", name,
+          r.kind == TableScript.Kind.EXPIRE_SNAPSHOTS
+              ? "the removal of what it chose, after the window," : "Iceberg's retry",
+          reference.failure, trace));
+    }
+    if ((run.failure == null) != (reference.failure == null)
+        || (run.failure != null && run.failure.getClass() != reference.failure.getClass())) {
+      throw new AssertionError(String.format(
+          "R %s in the %s but %s in the reference%n%s",
+          run.failure == null ? "committed" : "failed (" + run.failure + ")", name,
+          reference.failure == null ? "committed" : "failed (" + reference.failure + ")", trace));
+    }
+    List<String> differences = TableViews.differences(reference.view, run.view, "reference", name);
+    if (!differences.isEmpty()) {
+      throw new AssertionError("the " + name + "'s table differs from the reference's:\n  "
+          + String.join("\n  ", differences.subList(0, Math.min(4, differences.size())))
+          + "\n" + trace);
+    }
+  }
+
+  /**
+   * The paging of a subject's twin, block and window ({@link #verify}); none at index 0: every
+   * snapshot behind the newest sealed at once (1, 0), and blocks that seal one, two or three
+   * commits behind.
+   */
+  private static final int[][] TWINS = {null, {1, 0}, {1, 1}, {2, 1}, {3, 2}};
+
+  /** Half the tries run a paged twin of the subject. */
+  @Provide
+  Arbitrary<Integer> twins() {
+    return Arbitraries.frequency(
+        Tuple.of(4, 0), Tuple.of(1, 1), Tuple.of(1, 2), Tuple.of(1, 3), Tuple.of(1, 4));
+  }
+
+  private static Map<String, String> paging(int block, int window) {
+    return Map.of(
+        LogCatalogProperties.SNAPSHOT_BLOCK, String.valueOf(block),
+        LogCatalogProperties.SNAPSHOT_WINDOW, String.valueOf(window));
+  }
+
+  /**
+   * How R's record went in a subject that never pages and in its paged twin, the same but for
+   * paging (SNAPSHOT_PAGING.md, "Testing": admission differs only where it may). The twin may
+   * reject a record the subject admits only for a sealed snapshot it needed and did not carry,
+   * whose rejection says {@code sealed}: R's writer read the table before the window sealed what R
+   * builds on. Each rejection it counted for another reason the subject counted as often, and it
+   * admits no record the subject rejects.
+   */
+  private static String admission(Run unpaged, Run paged, String trace) {
+    if (!unpaged.raced || !unpaged.changed) {
+      return "not raced";
+    }
+    for (Map.Entry<String, Long> rejected : paged.reasons.entrySet()) {
+      if (!rejected.getKey().startsWith("sealed")
+          && unpaged.reasons.getOrDefault(rejected.getKey(), 0L) < rejected.getValue()) {
+        throw new AssertionError(String.format(
+            "the paged twin rejected R's records %d time(s) as \"%s\", the unpaged subject %d:"
+                + " paging may reject only a record that needs a sealed snapshot (rejections:"
+                + " unpaged %s, paged %s)%n%s",
+            rejected.getValue(), rejected.getKey(),
+            unpaged.reasons.getOrDefault(rejected.getKey(), 0L), unpaged.reasons, paged.reasons,
+            trace));
+      }
+    }
+    if (unpaged.conflicts > paged.conflicts) {
+      throw new AssertionError(String.format(
+          "the unpaged subject rejected R's records %d time(s), the paged twin %d: paging admitted"
+              + " a record the subject rejects (rejections: unpaged %s, paged %s)%n%s",
+          unpaged.conflicts, paged.conflicts, unpaged.reasons, paged.reasons, trace));
+    }
+    if (paged.conflicts > unpaged.conflicts) {
+      return unpaged.conflicts == 0 ? "admitted unpaged, rejected paged (sealed)"
+          : "rejected unpaged, rejected more paged (sealed)";
+    }
+    return unpaged.conflicts == 0 ? "admitted alike" : "rejected alike";
   }
 
   @Provide
@@ -1322,17 +1451,21 @@ class TestRebaseProperties {
     final boolean raced; // whether R wrote to the catalog, so the window ran before its write
     final boolean changed; // whether the window changed the table
     final long conflicts; // how many of R's commits conflicted where they landed
+    // their reasons, numbers masked (snapshot ids differ between runs)
+    final Map<String, Long> reasons;
     final Map<String, String> view;
     // whether a snapshot R added wrote a manifest that keeps files of earlier commits
     final boolean keptOlderFiles;
 
     private Run(InMemoryAtomicFileIO io, RuntimeException failure, boolean raced,
-        boolean changed, long conflicts, Map<String, String> view, boolean keptOlderFiles) {
+        boolean changed, long conflicts, Map<String, Long> reasons, Map<String, String> view,
+        boolean keptOlderFiles) {
       this.io = io;
       this.failure = failure;
       this.raced = raced;
       this.changed = changed;
       this.conflicts = conflicts;
+      this.reasons = reasons;
       this.view = view;
       this.keptOlderFiles = keptOlderFiles;
     }
@@ -1340,10 +1473,11 @@ class TestRebaseProperties {
     static Run of(String encoding, LocalCatalogMode mode, int formatVersion, boolean partitioned,
         boolean pinned, boolean merging, List<LocalCatalogMode> writers,
         List<TableScript.Cmd> prefix, List<TableScript.Cmd> window, TableScript.Cmd r,
-        StringBuilder trace) {
+        StringBuilder trace, Map<String, String> paging) {
       InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
       Map<String, String> properties = properties(merging);
       properties.put(LogCatalogProperties.CONFLICT_ENCODING, encoding);
+      properties.putAll(paging);
       LogCatalog catalog = mode.catalog(io, WAREHOUSE, "c", properties);
       if (!pinned) {
         catalog.leavingCommitOnceUnpinned();
@@ -1377,6 +1511,7 @@ class TestRebaseProperties {
         return Fault.NONE;
       });
       long conflicts = catalog.log().counts().conflicts();
+      Map<String, Long> reasonsBefore = reasons(catalog);
       RuntimeException failure;
       try {
         trace.append("R:\n");
@@ -1385,12 +1520,28 @@ class TestRebaseProperties {
         io.injectFaults((location, strategy) -> Fault.NONE);
       }
       conflicts = catalog.log().counts().conflicts() - conflicts;
-      trace.append(String.format("R %s after %d conflicts; window %s%n",
-          failure == null ? "committed" : "failed", conflicts, results));
+      Map<String, Long> reasons = new java.util.TreeMap<>();
+      reasons(catalog).forEach((reason, count) -> {
+        long more = count - reasonsBefore.getOrDefault(reason, 0L);
+        if (more > 0) {
+          reasons.put(reason, more);
+        }
+      });
+      trace.append(String.format("R %s after %d conflicts %s; window %s%n",
+          failure == null ? "committed" : "failed", conflicts, reasons, results));
       return new Run(io, failure, raced[0], raced[0] && !before[0].equals(after[0]), conflicts,
+          reasons,
           TableViews.logical(reader(io).loadTable(TableScript.ID),
               beforeR[0].snapshots().size(), beforeR[0].nextRowId()),
           keptOlderFiles(io, beforeR[0]));
+    }
+
+    /** The conflicts {@code catalog} counted by reason, numbers masked. */
+    private static Map<String, Long> reasons(LogCatalog catalog) {
+      Map<String, Long> reasons = new java.util.TreeMap<>();
+      catalog.log().counts().conflictReasons().forEach((reason, count) ->
+          reasons.merge(reason.replaceAll("[0-9]+", "#"), count, Long::sum));
+      return reasons;
     }
 
     /**
@@ -1519,7 +1670,7 @@ class TestRebaseProperties {
       } catch (RuntimeException e) {
         failure = e;
       }
-      return new Run(io, failure, true, true, 0,
+      return new Run(io, failure, true, true, 0, Map.of(),
           TableViews.logical(reader(io).loadTable(TableScript.ID),
               beforeR.snapshots().size(), beforeR.nextRowId()), false);
     }

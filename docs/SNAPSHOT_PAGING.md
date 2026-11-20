@@ -718,7 +718,20 @@ four tables). With paging set:
 - `TestInlineDifferentialProperties` runs `TableScript`'s schedules (with
   rollbacks and refs on old snapshots) on a pointer catalog, which pages
   nothing, and on a paged inline one: each step must commit alike in both,
-  and the tables read the same.
+  and the tables read the same. Its second property is a reference: the
+  schedule runs on two inline catalogs alike but for paging, one paged at a
+  block and window it draws (1 and 0, 1 and 1, 2 and 1, 3 and 2) whatever
+  the run sets, the other never paged, whose replay checks every delta
+  against the builder. Each step must end alike in both, the tables must
+  read the same (the paged one also as a worker reads it), and both must
+  round-trip their checkpoints. About half its tries seal a block.
+- `TestRebaseProperties` compares admission, record by record: in half its
+  tries, each property but the reads oracle runs its subject unpaged beside
+  a twin paged at a drawn block and window, which must end as its own
+  reference does. R lands behind a window, which often seals what R built
+  on. The twin may reject R's record where the subject admits it only with a
+  reason that says `sealed`; its other rejections must be the subject's, and
+  it must admit nothing the subject rejects.
 
 A round's faultA2 and faultB2 run at B = 2, W = 1, which reaches sealed
 blocks and import pages (step 5); the fault fuzzer reports the most sealed
