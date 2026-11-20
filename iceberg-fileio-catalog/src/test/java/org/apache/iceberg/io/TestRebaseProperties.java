@@ -855,18 +855,23 @@ class TestRebaseProperties {
     Run retried = Run.of(LamportEncoding.NAME, mode, formatVersion, partitioned, true, merging,
         writers, prefix, window, inner, step, new StringBuilder(), Map.of());
     // An expiry merged where it landed: the window, then what R chose on the prefix's table,
-    // removed
+    // removed. So too a transaction that comes to an expiry, its other members skipped or none
+    // (round p23-r0): the catalog merges it as one (errata D17)
+    boolean expiring = r.kind == TableScript.Kind.EXPIRE_SNAPSHOTS
+        || (r.kind == TableScript.Kind.TRANSACTION
+            && step.stream().anyMatch(c -> c.kind == TableScript.Kind.EXPIRE_SNAPSHOTS));
     Run[] expiry = {null};
+    boolean[] chosen = {false};
     java.util.function.Function<Run, Run> referenceOf = run -> {
-      if (r.kind != TableScript.Kind.EXPIRE_SNAPSHOTS || !run.raced || !run.changed
-          || run.conflicts > 0 || run.failure != null) {
+      if (!expiring || !run.raced || !run.changed || run.conflicts > 0 || run.failure != null) {
         return retried;
       }
-      if (expiry[0] == null) {
+      if (!chosen[0]) {
+        chosen[0] = true;
         expiry[0] = Run.expiryReference(mode, formatVersion, partitioned, merging, writers, prefix,
-            window, inner, r, trace);
+            window, inner, step, trace);
       }
-      return expiry[0];
+      return expiry[0] != null ? expiry[0] : retried;
     };
 
     String outcome;
@@ -1930,9 +1935,10 @@ class TestRebaseProperties {
      */
     static Run expiryReference(LocalCatalogMode mode, int formatVersion, boolean partitioned,
         boolean merging, List<LocalCatalogMode> writers, List<TableScript.Cmd> prefix,
-        List<TableScript.Cmd> window, List<TableScript.Cmd> inner, TableScript.Cmd r,
+        List<TableScript.Cmd> window, List<TableScript.Cmd> inner, List<TableScript.Cmd> rStep,
         StringBuilder trace) {
-      // What R chooses on the prefix's table
+      // What R chooses on the prefix's table: null if R adds a snapshot there (a transaction
+      // whose other members commit), which is no expiry
       InMemoryAtomicFileIO scratch = new InMemoryAtomicFileIO();
       LogCatalog chooser = mode.catalog(scratch, WAREHOUSE, "c", properties(merging));
       chooser.createNamespace(Namespace.of("ns"));
@@ -1942,8 +1948,13 @@ class TestRebaseProperties {
         chooses.run(step);
       }
       java.util.Set<Long> removed = sequenceNumbers(current(scratch));
-      chooses.run(List.of(r));
-      removed.removeAll(sequenceNumbers(current(scratch)));
+      chooses.refusingNoOpMembers(true); // as R's writer runs R
+      chooses.run(rStep);
+      java.util.Set<Long> after = sequenceNumbers(current(scratch));
+      if (!removed.containsAll(after)) {
+        return null;
+      }
+      removed.removeAll(after);
 
       InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
       Map<String, String> properties = properties(merging);
