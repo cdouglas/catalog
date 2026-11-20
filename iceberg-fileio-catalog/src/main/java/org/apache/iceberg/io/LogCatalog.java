@@ -3027,25 +3027,44 @@ public class LogCatalog extends BaseMetastoreViewCatalog
         renames.add(change);
       }
     }
-    // Renames after every drop and update, and each out of a name before any into it, so a rename
-    // takes a name the transaction frees in whatever order it staged them (Bug 124); one into a
-    // name still held (a swap) fails as the catalog's renameTable would
-    while (!renames.isEmpty()) {
-      TableChange next = renames.stream()
-          .filter(c -> !newCatalog.holds(c.renamedTo()))
+    // The views' drops and updates; their renames and creates follow
+    List<ViewChange> viewRenames = stageViewChanges(commit, current, newCatalog, droppedViews);
+
+    // Renames, tables' and views', after every drop and update, and each out of a name before any
+    // into it, so a rename takes a name the transaction frees, of either kind, in whatever order it
+    // staged them (Bug 124; errata D29 (txn takes no freed name), fixed); one into a name still
+    // held (a swap) fails as the catalog's renameTable or renameView would
+    List<Map.Entry<TableIdentifier, TableIdentifier>> pending = new ArrayList<>();
+    Set<TableIdentifier> viewsRenamed = new HashSet<>();
+    renames.forEach(c -> pending.add(Map.entry(c.identifier(), c.renamedTo())));
+    viewRenames.forEach(c -> {
+      pending.add(Map.entry(c.identifier(), c.renamedTo()));
+      viewsRenamed.add(c.identifier());
+    });
+    while (!pending.isEmpty()) {
+      Map.Entry<TableIdentifier, TableIdentifier> next = pending.stream()
+          .filter(r -> !newCatalog.nameHeld(r.getValue()))
           .findFirst()
-          .orElse(renames.get(0));
-      renames.remove(next);
-      newCatalog.renameTable(next.identifier(), next.renamedTo());
+          .orElse(pending.get(0));
+      pending.remove(next);
+      if (viewsRenamed.contains(next.getKey())) {
+        newCatalog.renameView(next.getKey(), next.getValue());
+      } else {
+        newCatalog.renameTable(next.getKey(), next.getValue());
+      }
     }
 
+    // Creates, into names free once its drops and renames apply (errata D29 (txn takes no freed
+    // name), fixed)
     for (Map.Entry<TableIdentifier, TableMetadata> created : commit.createdTables().entrySet()) {
       tableOpsAsRead(created.getKey(), current)
           .stageCreate(created.getValue(), newCatalog::wroteAhead)
           .accept(newCatalog);
     }
-
-    stageViewChanges(commit, current, newCatalog, droppedViews);
+    for (Map.Entry<TableIdentifier, ViewMetadata> created : commit.createdViews().entrySet()) {
+      ((LogViewOperations) newViewOps(created.getKey()))
+          .stageCreate(newCatalog, created.getValue());
+    }
 
     for (NamespaceChange change : commit.namespaceChanges()) {
       if (change.kind() == NamespaceChange.Kind.DROP) {
@@ -3075,17 +3094,16 @@ public class LogCatalog extends BaseMetastoreViewCatalog
   }
 
   /**
-   * Stages a catalog transaction's view changes on {@code newCatalog} (VIEWS.md "Stage 2"): each
-   * applies only to the view at the version the transaction read, which must be the view {@code
-   * current} has (a view's metadata is replaced whole, V6), and the record holds it until it lands.
-   * A drop of an inline view whose {@code gc.enabled} is false writes it to a file first, as {@link
-   * #dropView} does; a pointer view's file is deleted once the drop lands ({@code droppedViews}).
-   * An update and a create go inline, or to a metadata file written ahead, as a view's commit
-   * sends them. A view's create or rename takes no name the state before the record holds, nor a
-   * table a name a view holds there, though the transaction frees it (errata D29 (txn takes no
-   * freed name)).
+   * Stages a catalog transaction's changes to the views it had on {@code newCatalog} (VIEWS.md
+   * "Stage 2"), but their renames, which it returns, to stage with the tables' (a view's create is
+   * staged with the tables' creates): each applies only to the view at the version the transaction
+   * read, which must be the view {@code current} has (a view's metadata is replaced whole, V6), and
+   * the record holds it until it lands. A drop of an inline view whose {@code gc.enabled} is false
+   * writes it to a file first, as {@link #dropView} does; a pointer view's file is deleted once the
+   * drop lands ({@code droppedViews}). An update goes inline, or to a metadata file written ahead,
+   * as a view's commit sends it.
    */
-  private void stageViewChanges(
+  private List<ViewChange> stageViewChanges(
       CatalogCommit commit,
       Replica<CatalogState> current,
       CatalogMutation newCatalog,
@@ -3120,13 +3138,7 @@ public class LogCatalog extends BaseMetastoreViewCatalog
         renames.add(change);
       }
     }
-    for (ViewChange change : renames) {
-      newCatalog.renameView(change.identifier(), change.renamedTo());
-    }
-    for (Map.Entry<TableIdentifier, ViewMetadata> created : commit.createdViews().entrySet()) {
-      ((LogViewOperations) newViewOps(created.getKey()))
-          .stageCreate(newCatalog, created.getValue());
-    }
+    return renames;
   }
 
   /**

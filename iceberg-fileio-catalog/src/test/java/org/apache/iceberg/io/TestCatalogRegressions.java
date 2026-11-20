@@ -1202,6 +1202,178 @@ public class TestCatalogRegressions {
   // ============================================================
 
   /**
+   * Errata D29 (txn takes no freed name), fixed: a catalog transaction's create or rename takes a
+   * name the same transaction frees, of a table or a view, by a drop or a rename out. Its record
+   * frees the name before it takes it, and binds what takes it by the namespace's version, as
+   * every action verifies on the state before the record, which still holds the name (Bug 124's
+   * rule for a table's rename, for every kind). Before, the commit failed as {@code
+   * AlreadyExistsException}, with nothing applied.
+   */
+  @Nested
+  class TransactionsTakeNamesTheyFree {
+    private final Namespace ns = Namespace.of("ns");
+    private final TableIdentifier t = TableIdentifier.of(ns, "t");
+    private final TableIdentifier v = TableIdentifier.of(ns, "v");
+    private final InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+
+    private void createView(org.apache.iceberg.catalog.ViewCatalog catalog, TableIdentifier id,
+        String sql) {
+      catalog.buildView(id)
+          .withSchema(SCHEMA)
+          .withDefaultNamespace(id.namespace())
+          .withQuery("spark", sql)
+          .create();
+    }
+
+    private String sql(LogCatalog catalog, TableIdentifier view) {
+      return catalog.loadView(view).sqlFor("spark").sql();
+    }
+
+    /**
+     * A view dropped and another created of its name. (A table's create of a name its transaction
+     * drops is refused as it stages, for every catalog: the fork's BaseCatalogTransaction creates
+     * through the origin's table builder, which still finds the table there.)
+     */
+    @ParameterizedTest
+    @EnumSource(names = {"APPEND", "CAS", "MEMLOG", "AZLOG", "CAS_TM", "APPEND_ML"})
+    void aNameFreedIsTakenByItsOwnKind(LocalCatalogMode mode) {
+      LogCatalog catalog = mode.catalog(io, WAREHOUSE, "c", Map.of());
+      catalog.createNamespace(ns);
+      catalog.createTable(t, SCHEMA);
+      createView(catalog, v, "select 1");
+
+      CatalogTransaction txn = catalog.createTransaction(CatalogTransaction.IsolationLevel.SNAPSHOT);
+      assertThat(txn.asViewCatalog().dropView(v)).isTrue();
+      createView(txn.asViewCatalog(), v, "select 2");
+      assertThat(txn.asCatalog().dropTable(t, false)).isTrue();
+      assertThatThrownBy(() -> txn.asCatalog().buildTable(t, SCHEMA).create())
+          .isInstanceOf(AlreadyExistsException.class);
+      txn.commitTransaction();
+
+      LogCatalog reader = mode.catalog(io, WAREHOUSE, "c", Map.of());
+      assertThat(reader.tableExists(t)).isFalse();
+      assertThat(sql(reader, v)).isEqualTo("select 2");
+      assertThat(reader.loadView(v).currentVersion().versionId()).isEqualTo(1);
+      mode.assertCommitPolicy(io);
+    }
+
+    /**
+     * A view dropped and a table created of its name, and a table renamed away and a view created
+     * of its name; then a chain of renames across kinds, each into the name the next frees: the
+     * view w to the table's name t, the table t to v.
+     */
+    @ParameterizedTest
+    @EnumSource(names = {"APPEND", "CAS", "MEMLOG", "AZLOG", "CAS_TM", "APPEND_ML"})
+    void aNameFreedIsTakenByTheOtherKind(LocalCatalogMode mode) {
+      LogCatalog catalog = mode.catalog(io, WAREHOUSE, "c", Map.of());
+      catalog.createNamespace(ns);
+      TableIdentifier u = TableIdentifier.of(ns, "u");
+      catalog.createTable(t, SCHEMA);
+      createView(catalog, v, "select 1");
+
+      CatalogTransaction txn = catalog.createTransaction(CatalogTransaction.IsolationLevel.SNAPSHOT);
+      assertThat(txn.asViewCatalog().dropView(v)).isTrue();
+      txn.asCatalog().buildTable(v, SCHEMA).create();
+      txn.asCatalog().renameTable(t, u);
+      createView(txn.asViewCatalog(), t, "select 2");
+      txn.commitTransaction();
+
+      LogCatalog reader = mode.catalog(io, WAREHOUSE, "c", Map.of());
+      assertThat(reader.listTables(ns)).containsExactlyInAnyOrder(u, v);
+      assertThat(reader.listViews(ns)).containsExactly(t);
+      assertThat(sql(reader, t)).isEqualTo("select 2");
+
+      // w takes t, which t frees as it takes v, which u frees
+      TableIdentifier w = TableIdentifier.of(ns, "w");
+      createView(catalog, w, "select 3");
+      CatalogTransaction chain =
+          catalog.createTransaction(CatalogTransaction.IsolationLevel.SNAPSHOT);
+      assertThat(chain.asCatalog().dropTable(v, false)).isTrue();
+      chain.asViewCatalog().renameView(t, v);
+      chain.asViewCatalog().renameView(w, t);
+      chain.commitTransaction();
+
+      reader = mode.catalog(io, WAREHOUSE, "c", Map.of());
+      assertThat(reader.listTables(ns)).containsExactly(u);
+      assertThat(reader.listViews(ns)).containsExactlyInAnyOrder(t, v);
+      assertThat(sql(reader, v)).isEqualTo("select 2");
+      assertThat(sql(reader, t)).isEqualTo("select 3");
+      mode.assertCommitPolicy(io);
+    }
+
+    /**
+     * The record frees a name before what takes it, whatever order the transaction staged them
+     * in, and binds what takes it by the namespace's version, under either create condition.
+     */
+    @ParameterizedTest
+    @EnumSource(CatalogMutation.CreateCondition.class)
+    void itsRecordFreesANameBeforeTakingItByTheNamespacesVersion(
+        CatalogMutation.CreateCondition condition) {
+      LogCatalog catalog = LocalCatalogMode.APPEND.catalog(io, WAREHOUSE, "c", Map.of());
+      catalog.createNamespace(ns);
+      createView(catalog, v, "select 1");
+      catalog.createTable(t, SCHEMA);
+      CatalogMutation mutation = new CatalogMutation(catalog.log().read(), condition)
+          .renameTable(t, TableIdentifier.of(ns, "u"))
+          .dropView(v)
+          .createTable(v, WAREHOUSE + "/ns/v/metadata/staged.metadata.json")
+          .createView(t, CatalogState.ViewMetadataRef.location(WAREHOUSE + "/ns/t/v.json"));
+
+      List<ProtoCodec.Action> actions = mutation.intention().actions();
+      List<String> kinds = actions.stream().map(a -> a.getClass().getSimpleName()).toList();
+      assertThat(kinds).containsExactly("DropViewAction", "RenameTableAction",
+          "CreateTableAction", "CreateViewAction");
+      assertThat(((ProtoCodec.CreateTableAction) actions.get(2)).byName).isFalse();
+      assertThat(((ProtoCodec.CreateViewAction) actions.get(3)).byName).isFalse();
+    }
+
+    /**
+     * What takes a freed name binds by the namespace's version, so a change in the namespace
+     * since the transaction's read, here another writer's create of an unrelated table, fails the
+     * commit as a conflict, with nothing applied: the price of the fix, where a create by name
+     * would hold (CATALOG_TRANSACTIONS.md).
+     */
+    @ParameterizedTest
+    @EnumSource(names = {"APPEND", "CAS", "MEMLOG", "AZLOG"})
+    void aFreedNameIsLostToAnyChangeOfItsNamespace(LocalCatalogMode mode) {
+      LogCatalog catalog = mode.catalog(io, WAREHOUSE, "c", Map.of());
+      catalog.createNamespace(ns);
+      createView(catalog, v, "select 1");
+      CatalogMutation mutation = new CatalogMutation(catalog.log().read())
+          .dropView(v)
+          .createTable(v, WAREHOUSE + "/ns/v/metadata/staged.metadata.json");
+      LogCatalog other = mode.catalog(io, WAREHOUSE, "c", Map.of());
+      other.createTable(TableIdentifier.of(ns, "unrelated"), SCHEMA);
+
+      assertThatThrownBy(() -> mutation.commit(catalog.log()))
+          .isInstanceOf(CommitFailedException.class);
+      LogCatalog reader = mode.catalog(io, WAREHOUSE, "c", Map.of());
+      assertThat(reader.viewExists(v)).isTrue();
+      assertThat(reader.tableExists(v)).isFalse();
+    }
+
+    /** A swap, each of two names taken by what the other frees, is refused as it was. */
+    @ParameterizedTest
+    @EnumSource(names = {"APPEND", "CAS_TM"})
+    void aSwapAcrossKindsIsRefused(LocalCatalogMode mode) {
+      LogCatalog catalog = mode.catalog(io, WAREHOUSE, "c", Map.of());
+      catalog.createNamespace(ns);
+      catalog.createTable(t, SCHEMA);
+      createView(catalog, v, "select 1");
+
+      CatalogTransaction txn = catalog.createTransaction(CatalogTransaction.IsolationLevel.SNAPSHOT);
+      txn.asCatalog().renameTable(t, TableIdentifier.of(ns, "x"));
+      txn.asViewCatalog().renameView(v, t);
+      txn.asCatalog().renameTable(TableIdentifier.of(ns, "x"), v);
+      // staged as t -> v and v -> t: a swap, which neither order applies
+      assertThatThrownBy(txn::commitTransaction).isInstanceOf(AlreadyExistsException.class);
+      LogCatalog reader = mode.catalog(io, WAREHOUSE, "c", Map.of());
+      assertThat(reader.listTables(ns)).containsExactly(t);
+      assertThat(reader.listViews(ns)).containsExactly(v);
+    }
+  }
+
+  /**
    * Views share a namespace's names with tables (V7), conflict on their version, bump the
    * namespace a drop of it names (V8), move between a file and inline as their writers do (V2,
    * V3), and leave a pointer view's file only where its drop's outcome is unknown (V9).

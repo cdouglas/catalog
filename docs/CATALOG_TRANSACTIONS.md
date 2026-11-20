@@ -133,11 +133,15 @@ record never applies once the name is free again (SPEC.md, "Action Verification 
 transaction whose read a sibling's drop overtook fails, as one that conflicts does. By
 `namespace`, it checks that the namespace's version is the one that read held, which any change
 there moves (a sibling created or dropped, a property set): a stricter condition than the table
-states, under which creates in one namespace land one at a time. A rename into a name the
-transaction frees binds by the namespace's version under either setting: the record drops or
-renames out the table that held the name before it renames another in, but replay verifies each
-action on the state before the record, where the name is still taken (Bug 124 (rename into freed
-name fails)).
+states, under which creates in one namespace land one at a time. A create or rename into a name the
+transaction frees, of a table or a view, binds by the namespace's version under either setting: the
+record drops or renames out what held the name before it takes it, but replay verifies each action
+on the state before the record, where the name is still taken (Bug 124 (rename into freed name
+fails), for a table's rename; for the rest since errata D29 (txn takes no freed name) was fixed). So
+such a transaction fails if anything changed in that namespace since its read, where a create by
+name of a free name would hold. (A table's create of a name its transaction drops is refused as it
+stages, for every catalog: `BaseCatalogTransaction` creates through the origin's table builder,
+which still finds the table.)
 
 The transaction sees its own changes: a dropped table no longer loads, a renamed one loads under its
 new name only, a created one loads and takes updates, listings include them. Every table it loads is

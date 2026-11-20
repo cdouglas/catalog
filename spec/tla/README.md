@@ -1220,8 +1220,10 @@ landings the shared-log model has. The cross-kind, version and namespace switche
 `Serializable` on either log, without faults.
 
 **Not modelled.** Child namespaces (a child's drop counts in its parent's removals:
-`creates.sh`'s `nsdropnobump`); catalog transactions (a rename into a name its own record frees,
-Bug 124 (rename into freed name fails)); a named table's commits, which stay writes of
+`creates.sh`'s `nsdropnobump`); catalog transactions (a create or rename into a name its own
+record frees, of either kind, bound by the namespace's version: Bug 124 (rename into freed name
+fails), and errata D29 (txn takes no freed name), fixed); a named table's
+commits, which stay writes of
 entities; the forms, inline or pointer, and the files a drop deletes (`views.sh`'s
 `viewdeletefirst`); the fuzzers' oracle schedules on named operations.
 

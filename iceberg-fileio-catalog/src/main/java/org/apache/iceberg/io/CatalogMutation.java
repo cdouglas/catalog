@@ -97,7 +97,12 @@ public class CatalogMutation {
   // Tables a serializable transaction read: the refs it read (a read witness), or none, a read of
   // the whole version (a read pin)
   private final Map<TableIdentifier, java.util.SortedSet<String>> readTables;
+  // Tables created, each to its metadata file's location
   private final Map<TableIdentifier, String> tables;
+  // Tables of the read dropped, by their names there: a name a drop frees may be taken by a create
+  // of this transaction (errata D29 (txn takes no freed name), fixed), so drops and creates are
+  // kept apart
+  private final Set<TableIdentifier> tableDrops;
   private final Map<TableIdentifier, String> tableUpdates;
   private final Map<Namespace, Boolean> namespaces;
   private final Map<Namespace, Map<String, String>> namespaceProperties;
@@ -169,6 +174,7 @@ public class CatalogMutation {
     this.createCondition = createCondition;
     this.original = base.state();
     this.tables = Maps.newHashMap();
+    this.tableDrops = Sets.newHashSet();
     this.readTables = Maps.newHashMap();
     this.tableUpdates = Maps.newHashMap();
     this.namespaces = Maps.newHashMap();
@@ -314,9 +320,8 @@ public class CatalogMutation {
                 .filter(tbl -> !markedForDrop(tbl) && !tableRenames.containsKey(tbl))
                 .map(TableIdentifier::namespace)
                 .noneMatch(ns -> ns.equals(namespace))
-            && tables.entrySet().stream()
-                .filter(e -> e.getValue() != null) // only table creations
-                .map(e -> e.getKey().namespace())
+            && tables.keySet().stream()
+                .map(TableIdentifier::namespace)
                 .noneMatch(ns -> ns.equals(namespace))
             // inline tables this transaction creates (Bug 74: these were missed, so the drop
             // staged, and replay rejected the commit as a conflict)
@@ -347,12 +352,12 @@ public class CatalogMutation {
   }
 
   public CatalogMutation createTable(TableIdentifier table, String location) {
-    // TODO: fix for swap (a -> b; b -> a)
     if (checkNamespaceExists(table.namespace())) {
       throw new NoSuchNamespaceException("Namespace does not exist: %s", table.namespace());
     }
-    if (original.containsTable(table) || tables.get(table) != null
-        || inlineTables.get(table) != null || tableRenames.containsValue(table)) {
+    // a name this transaction frees, of a table or a view, is free (errata D29 (txn takes no freed
+    // name), fixed)
+    if (holds(table)) {
       throw new AlreadyExistsException("Table already exists: %s", table);
     }
     checkNoView(table);
@@ -397,6 +402,10 @@ public class CatalogMutation {
   }
 
   public CatalogMutation updateTable(TableIdentifier table, String location) {
+    if (tables.containsKey(table)) {
+      tables.put(table, location); // a table this transaction creates
+      return this;
+    }
     if (!original.containsTable(table)) {
       throw new NoSuchTableException("Table does not exist: %s", table);
     }
@@ -404,12 +413,7 @@ public class CatalogMutation {
     if (markedForDrop(table)) {
       throw new IllegalArgumentException("Cannot update table marked for deletion: " + table);
     }
-    final String newloc = tables.get(table);
-    if (newloc != null) {
-      tables.put(table, location);
-    } else {
-      tableUpdates.put(table, location);
-    }
+    tableUpdates.put(table, location);
     return this;
   }
 
@@ -424,7 +428,7 @@ public class CatalogMutation {
     Preconditions.checkNotNull(to, "Destination table cannot be null");
     Preconditions.checkArgument(!from.equals(to), "Source and destination identifiers are equal");
     // Source must exist and not already be marked for delete in this transaction.
-    if (!original.containsTable(from) || (tables.containsKey(from) && tables.get(from) == null)) {
+    if (!original.containsTable(from) || tableDrops.contains(from)) {
       throw new NoSuchTableException("Table does not exist: %s", from);
     }
     checkNotRenamed(from);
@@ -433,7 +437,8 @@ public class CatalogMutation {
       throw new NoSuchNamespaceException("Namespace does not exist: %s", to.namespace());
     }
     // Destination must not already exist (in original or pending creates): a name this
-    // transaction frees, by a drop or a rename out of it staged before, is free (Bug 124)
+    // transaction frees, by a drop or a rename out of it staged before, of a table (Bug 124) or a
+    // view (errata D29 (txn takes no freed name), fixed), is free
     if (holds(to)) {
       throw new AlreadyExistsException("Table already exists: %s", to);
     }
@@ -450,16 +455,36 @@ public class CatalogMutation {
    */
   boolean holds(TableIdentifier name) {
     return (original.containsTable(name) && !frees(name))
-        || tables.get(name) != null
+        || tables.containsKey(name)
         || inlineTables.containsKey(name)
         || tableRenames.containsValue(name);
+  }
+
+  /** Whether a table or a view has {@code name} in this transaction's view ({@link #holds}). */
+  boolean nameHeld(TableIdentifier name) {
+    return holds(name) || viewHolds(name);
   }
 
   /** Whether this transaction frees {@code name}, which its read holds: a drop, or a rename out. */
   private boolean frees(TableIdentifier name) {
     return original.containsTable(name)
-        && ((tables.containsKey(name) && tables.get(name) == null)
-            || tableRenames.containsKey(name));
+        && (tableDrops.contains(name) || tableRenames.containsKey(name));
+  }
+
+  /** As {@link #frees}, of a view: a drop, or a rename out. */
+  private boolean viewFrees(TableIdentifier name) {
+    return original.containsView(name)
+        && (viewDrops.contains(name) || viewRenames.containsKey(name));
+  }
+
+  /**
+   * Whether a create or rename into {@code name} takes a name this transaction frees, of a table or
+   * a view: the record frees it before it takes it, and binds it by the namespace's version, as
+   * every action verifies on the state before the record, which holds the name (errata D29 (txn
+   * takes no freed name), fixed; Bug 124).
+   */
+  private boolean takesAFreedName(TableIdentifier name) {
+    return original.containsTable(name) || original.containsView(name);
   }
 
   // ============================================================
@@ -478,7 +503,7 @@ public class CatalogMutation {
     if (viewHolds(view)) {
       throw new AlreadyExistsException("View already exists: %s", view);
     }
-    if (tableHolds(view)) {
+    if (holds(view)) {
       throw new AlreadyExistsException("Table with same name already exists: %s", view);
     }
     viewCreates.put(view, metadata);
@@ -517,7 +542,7 @@ public class CatalogMutation {
     if (viewHolds(to)) {
       throw new AlreadyExistsException("Cannot rename %s to %s. View already exists", from, to);
     }
-    if (tableHolds(to)) {
+    if (holds(to)) {
       throw new AlreadyExistsException("Cannot rename %s to %s. Table already exists", from, to);
     }
     viewRenames.put(from, to);
@@ -538,19 +563,11 @@ public class CatalogMutation {
     return viewCreates.containsKey(view) || viewUpdates.containsKey(view);
   }
 
-  // Whether a view holds the name, so far as this transaction stages it: one in the read (even one
-  // it drops or renames out: a view's create or rename binds by name, which the state before the
-  // record holds, so a view takes no name its own record frees), one created, or one renamed in
+  // Whether a view holds the name, so far as this transaction stages it: one in the read it does
+  // not drop or rename out, one created, or one renamed in
   private boolean viewHolds(TableIdentifier ident) {
-    return original.containsView(ident) || viewCreates.containsKey(ident)
+    return (original.containsView(ident) && !viewFrees(ident)) || viewCreates.containsKey(ident)
         || viewRenames.containsValue(ident);
-  }
-
-  // As viewHolds, for tables, a name the transaction frees included: a view takes no such name,
-  // where a table's rename may ({@link #holds}, Bug 124)
-  private boolean tableHolds(TableIdentifier ident) {
-    return original.containsTable(ident) || tables.get(ident) != null
-        || inlineTables.containsKey(ident) || tableRenames.containsValue(ident);
   }
 
   private void checkNoView(TableIdentifier table) {
@@ -600,7 +617,7 @@ public class CatalogMutation {
     inlineTableImports.remove(tableId);
     inlineTableDeltaUpdates.remove(tableId);
     evictions.remove(tableId);
-    tables.put(tableId, null);
+    tableDrops.add(tableId);
     return this;
   }
 
@@ -612,8 +629,7 @@ public class CatalogMutation {
     if (checkNamespaceExists(table.namespace())) {
       throw new NoSuchNamespaceException("Namespace does not exist: %s", table.namespace());
     }
-    if (original.containsTable(table) || tables.get(table) != null
-        || inlineTables.get(table) != null || tableRenames.containsValue(table)) {
+    if (holds(table)) {
       throw new AlreadyExistsException("Table already exists: %s", table);
     }
     checkNoView(table);
@@ -974,7 +990,7 @@ public class CatalogMutation {
   // A table this transaction drops: replay rejects a record that drops a table it also reads or
   // updates (Bug 14), whether the table is inline or not.
   private boolean markedForDrop(TableIdentifier table) {
-    return tables.containsKey(table) && tables.get(table) == null;
+    return tableDrops.contains(table);
   }
 
   // A table renamed earlier in this transaction no longer exists under its old name.
@@ -1077,35 +1093,22 @@ public class CatalogMutation {
       }
     }
 
-    // Process table creates and drops. This transaction uses the `tables` map
-    // for both: a non-null value is a create-with-location, a null value is
-    // a drop marker. Inline-table creates use a separate inlineTables map.
-    for (Map.Entry<TableIdentifier, String> entry : tables.entrySet()) {
-      TableIdentifier ident = entry.getKey();
-      String metadataLocation = entry.getValue();
-
-      if (metadataLocation == null) {
-        Integer tblId = original.tableId(ident);
-        if (tblId != null) {
-          int version = original.tableVersion(tblId);
-          actions.add(new ProtoCodec.DropTableAction(tblId, version));
-        }
-        continue;
+    // The names this record frees, first: replay verifies every action on the state before the
+    // record, where a name a drop or rename out frees is still held, and applies them in order, so
+    // a create or rename into a freed name (bound by the namespace's version: errata D29 (txn takes
+    // no freed name), fixed; Bug 124) follows what frees it. Then the updates; the renames, each
+    // out of a name before any into it, of either kind; the creates; and the namespace drops.
+    for (TableIdentifier ident : tableDrops.stream()
+        .sorted(Comparator.comparing(TableIdentifier::toString)).collect(Collectors.toList())) {
+      Integer tblId = original.tableId(ident);
+      if (tblId != null) {
+        actions.add(new ProtoCodec.DropTableAction(tblId, original.tableVersion(tblId)));
       }
-
-      Namespace ns = ident.namespace();
-      Integer nsId = original.namespaceId(ns);
-      int nsVersion = -1;
-      if (nsId == null) {
-        // Namespace created in same transaction
-        nsId = nsIdMap.get(ns);
-      } else {
-        nsVersion = bindingRead(nsId);
-      }
-
-      int tblId = nextLateTblid--;
-      actions.add(new ProtoCodec.CreateTableAction(
-          tblId, 1, nsId, byName(), nsVersion, ident.name(), metadataLocation));
+    }
+    for (TableIdentifier view : viewDrops.stream()
+        .sorted(Comparator.comparing(TableIdentifier::toString)).collect(Collectors.toList())) {
+      int viewId = original.viewId(view);
+      actions.add(new ProtoCodec.DropViewAction(viewId, original.viewVersion(viewId)));
     }
 
     // Process table updates
@@ -1126,28 +1129,6 @@ public class CatalogMutation {
         int version = original.tableVersion(tblId);
         actions.add(new ProtoCodec.ReadTableAction(tblId, version, List.copyOf(read.getValue())));
       }
-    }
-
-    // Process inline table creates
-    for (Map.Entry<TableIdentifier, byte[]> entry : inlineTables.entrySet()) {
-      TableIdentifier ident = entry.getKey();
-      byte[] metadata = entry.getValue();
-      Byte codecTag = inlineTableCodecs.get(ident);
-      byte codec = codecTag != null ? codecTag : InlineMetadataCodecs.TAG_JSON_GZIP;
-      Namespace ns = ident.namespace();
-
-      Integer nsId = original.namespaceId(ns);
-      int nsVersion = -1;
-      if (nsId == null) {
-        nsId = nsIdMap.get(ns);
-      } else {
-        nsVersion = bindingRead(nsId);
-      }
-
-      int tblId = nextLateTblid--;
-      byte[] createDelta = inlineTableCreateDeltas.get(ident);
-      actions.add(new ProtoCodec.CreateTableInlineAction(
-          tblId, 1, nsId, byName(), nsVersion, ident.name(), metadata, codec, createDelta));
     }
 
     // Process inline table updates (full mode, optionally with bundled ML delta)
@@ -1187,76 +1168,110 @@ public class CatalogMutation {
       }
     }
 
-    // Process table renames (in-place, id-stable). See SPEC_TM.md "Rename".
-    for (Map.Entry<TableIdentifier, TableIdentifier> entry : tableRenames.entrySet()) {
-      TableIdentifier from = entry.getKey();
-      TableIdentifier to = entry.getValue();
-      Integer tblId = original.tableId(from);
-      if (tblId == null) {
-        continue;
-      }
-      int version = original.tableVersion(tblId);
-      Namespace newNs = to.namespace();
-      Integer newNsId = original.namespaceId(newNs);
-      int newNsVersion;
-      boolean byName = byName();
-      if (newNsId == null) {
-        // Destination namespace was created in this same transaction.
-        newNsId = nsIdMap.get(newNs);
-        newNsVersion = -1;
-      } else if (original.containsTable(to)) {
-        // A name this transaction frees (renameTable), by a drop or a rename out that the record
-        // applies first, is taken where every action verifies, the state before the record: it
-        // binds by the namespace's version, which every change of the namespace's names moves
-        // (Bug 124)
-        byName = false;
-        newNsVersion = original.namespaceVersion(newNsId);
-      } else {
-        newNsVersion = bindingRead(newNsId);
-      }
-      actions.add(new ProtoCodec.RenameTableAction(
-          tblId, version, newNsId, byName, newNsVersion, to.name()));
-    }
-
-    // Views: creates (late-bound ids of their own), updates, renames and drops, each on the
-    // version read
-    int nextLateViewId = -1;
-    for (Map.Entry<TableIdentifier, CatalogState.ViewMetadataRef> entry
-        : sortedByName(viewCreates).entrySet()) {
-      TableIdentifier ident = entry.getKey();
-      Integer nsId = original.namespaceId(ident.namespace());
-      int nsRead = -1;
-      if (nsId == null) {
-        nsId = nsIdMap.get(ident.namespace());
-      } else {
-        nsRead = bindingRead(nsId);
-      }
-      actions.add(new ProtoCodec.CreateViewAction(
-          nextLateViewId--, 1, nsId, byName(), nsRead, ident.name(), entry.getValue()));
-    }
     for (Map.Entry<TableIdentifier, CatalogState.ViewMetadataRef> entry
         : sortedByName(viewUpdates).entrySet()) {
       int viewId = original.viewId(entry.getKey());
       actions.add(new ProtoCodec.UpdateViewAction(
           viewId, original.viewVersion(viewId), entry.getValue()));
     }
-    for (Map.Entry<TableIdentifier, TableIdentifier> entry : sortedByName(viewRenames).entrySet()) {
-      int viewId = original.viewId(entry.getKey());
-      TableIdentifier to = entry.getValue();
+
+    // Renames (in place, id-stable; SPEC_TM.md "Rename"), tables' and views', each after any rename
+    // out of the name it takes; staging refused a cycle (a swap)
+    for (Map.Entry<TableIdentifier, TableIdentifier> rename : renameOrder()) {
+      TableIdentifier from = rename.getKey();
+      TableIdentifier to = rename.getValue();
+      boolean view = viewRenames.containsKey(from);
       Integer newNsId = original.namespaceId(to.namespace());
-      int newNsRead = -1;
+      boolean byName = byName();
+      int newNsRead;
       if (newNsId == null) {
+        // Destination namespace was created in this same transaction.
         newNsId = nsIdMap.get(to.namespace());
+        newNsRead = -1;
+      } else if (takesAFreedName(to)) {
+        byName = false;
+        newNsRead = original.namespaceVersion(newNsId);
       } else {
         newNsRead = bindingRead(newNsId);
       }
-      actions.add(new ProtoCodec.RenameViewAction(
-          viewId, original.viewVersion(viewId), newNsId, byName(), newNsRead, to.name()));
+      if (view) {
+        int viewId = original.viewId(from);
+        actions.add(new ProtoCodec.RenameViewAction(
+            viewId, original.viewVersion(viewId), newNsId, byName, newNsRead, to.name()));
+      } else {
+        Integer tblId = original.tableId(from);
+        if (tblId != null) {
+          actions.add(new ProtoCodec.RenameTableAction(
+              tblId, original.tableVersion(tblId), newNsId, byName, newNsRead, to.name()));
+        }
+      }
     }
-    for (TableIdentifier view : viewDrops.stream()
-        .sorted(Comparator.comparing(TableIdentifier::toString)).collect(Collectors.toList())) {
-      int viewId = original.viewId(view);
-      actions.add(new ProtoCodec.DropViewAction(viewId, original.viewVersion(viewId)));
+
+    // Creates: tables (a metadata file's, then inline), then views (late-bound ids of their own)
+    for (Map.Entry<TableIdentifier, String> entry : sortedByName(tables).entrySet()) {
+      TableIdentifier ident = entry.getKey();
+      Namespace ns = ident.namespace();
+      Integer nsId = original.namespaceId(ns);
+      boolean byName = byName();
+      int nsVersion = -1;
+      if (nsId == null) {
+        // Namespace created in same transaction
+        nsId = nsIdMap.get(ns);
+      } else if (takesAFreedName(ident)) {
+        byName = false;
+        nsVersion = original.namespaceVersion(nsId);
+      } else {
+        nsVersion = bindingRead(nsId);
+      }
+
+      int tblId = nextLateTblid--;
+      actions.add(new ProtoCodec.CreateTableAction(
+          tblId, 1, nsId, byName, nsVersion, ident.name(), entry.getValue()));
+    }
+
+    // Process inline table creates
+    for (Map.Entry<TableIdentifier, byte[]> entry : sortedByName(inlineTables).entrySet()) {
+      TableIdentifier ident = entry.getKey();
+      byte[] metadata = entry.getValue();
+      Byte codecTag = inlineTableCodecs.get(ident);
+      byte codec = codecTag != null ? codecTag : InlineMetadataCodecs.TAG_JSON_GZIP;
+      Namespace ns = ident.namespace();
+
+      Integer nsId = original.namespaceId(ns);
+      boolean byName = byName();
+      int nsVersion = -1;
+      if (nsId == null) {
+        nsId = nsIdMap.get(ns);
+      } else if (takesAFreedName(ident)) {
+        byName = false;
+        nsVersion = original.namespaceVersion(nsId);
+      } else {
+        nsVersion = bindingRead(nsId);
+      }
+
+      int tblId = nextLateTblid--;
+      byte[] createDelta = inlineTableCreateDeltas.get(ident);
+      actions.add(new ProtoCodec.CreateTableInlineAction(
+          tblId, 1, nsId, byName, nsVersion, ident.name(), metadata, codec, createDelta));
+    }
+
+    int nextLateViewId = -1;
+    for (Map.Entry<TableIdentifier, CatalogState.ViewMetadataRef> entry
+        : sortedByName(viewCreates).entrySet()) {
+      TableIdentifier ident = entry.getKey();
+      Integer nsId = original.namespaceId(ident.namespace());
+      boolean byName = byName();
+      int nsRead = -1;
+      if (nsId == null) {
+        nsId = nsIdMap.get(ident.namespace());
+      } else if (takesAFreedName(ident)) {
+        byName = false;
+        nsRead = original.namespaceVersion(nsId);
+      } else {
+        nsRead = bindingRead(nsId);
+      }
+      actions.add(new ProtoCodec.CreateViewAction(
+          nextLateViewId--, 1, nsId, byName, nsRead, ident.name(), entry.getValue()));
     }
 
     // Namespace drops last, children before parents: a namespace this transaction drops is empty
@@ -1281,6 +1296,27 @@ public class CatalogMutation {
     return createCondition == CreateCondition.NAME;
   }
 
+  /**
+   * This transaction's renames, tables' and views', in the order its record applies them: each
+   * after any rename out of the name it takes, else in order of their identifiers.
+   */
+  private List<Map.Entry<TableIdentifier, TableIdentifier>> renameOrder() {
+    List<Map.Entry<TableIdentifier, TableIdentifier>> left = new ArrayList<>();
+    left.addAll(tableRenames.entrySet());
+    left.addAll(viewRenames.entrySet());
+    left.sort(Comparator.comparing(rename -> rename.getKey().toString()));
+    List<Map.Entry<TableIdentifier, TableIdentifier>> ordered = new ArrayList<>();
+    while (!left.isEmpty()) {
+      Map.Entry<TableIdentifier, TableIdentifier> next = left.stream()
+          .filter(r -> left.stream().noneMatch(o -> o.getKey().equals(r.getValue())))
+          .findFirst()
+          .orElse(left.get(0));
+      left.remove(next);
+      ordered.add(next);
+    }
+    return ordered;
+  }
+
   // In order of their identifiers, so that a transaction's record is a function of what it staged
   private static <V> java.util.SortedMap<TableIdentifier, V> sortedByName(
       Map<TableIdentifier, V> map) {
@@ -1299,12 +1335,10 @@ public class CatalogMutation {
    * source gone, as it would have after it.
    */
   RuntimeException explain(CatalogState state, String message) {
-    for (Map.Entry<TableIdentifier, String> e : tables.entrySet()) {
-      if (e.getValue() != null) {
-        RuntimeException taken = tableNameTaken(state, e.getKey());
-        if (taken != null) {
-          return taken;
-        }
+    for (TableIdentifier table : tables.keySet()) {
+      RuntimeException taken = tableNameTaken(state, table);
+      if (taken != null) {
+        return taken;
       }
     }
     for (TableIdentifier table : inlineTables.keySet()) {
@@ -1317,22 +1351,20 @@ public class CatalogMutation {
       if (!state.containsTable(rename.getKey())) {
         return new NoSuchTableException("Table does not exist: %s", rename.getKey());
       }
-      // A name this transaction frees is held by the table it frees until the record applies
       TableIdentifier to = rename.getValue();
-      if (state.containsTable(to)
-          && !(frees(to) && java.util.Objects.equals(state.tableId(to), original.tableId(to)))) {
+      if (tableThere(state, to)) {
         return new AlreadyExistsException("Table already exists: %s", to);
       }
-      if (state.containsView(rename.getValue())) {
+      if (viewThere(state, to)) {
         return new AlreadyExistsException(
             "Cannot rename %s to %s. View already exists", rename.getKey(), rename.getValue());
       }
     }
     for (TableIdentifier view : viewCreates.keySet()) {
-      if (state.containsView(view)) {
+      if (viewThere(state, view)) {
         return new AlreadyExistsException("View already exists: %s", view);
       }
-      if (state.containsTable(view)) {
+      if (tableThere(state, view)) {
         return new AlreadyExistsException("Table with same name already exists: %s", view);
       }
     }
@@ -1340,11 +1372,11 @@ public class CatalogMutation {
       if (!state.containsView(rename.getKey())) {
         return new NoSuchViewException("View does not exist: %s", rename.getKey());
       }
-      if (state.containsView(rename.getValue())) {
+      if (viewThere(state, rename.getValue())) {
         return new AlreadyExistsException(
             "Cannot rename %s to %s. View already exists", rename.getKey(), rename.getValue());
       }
-      if (state.containsTable(rename.getValue())) {
+      if (tableThere(state, rename.getValue())) {
         return new AlreadyExistsException(
             "Cannot rename %s to %s. Table already exists", rename.getKey(), rename.getValue());
       }
@@ -1353,14 +1385,28 @@ public class CatalogMutation {
   }
 
   // Why a table create of the name fails on state, if a table or a view holds it
-  private static RuntimeException tableNameTaken(CatalogState state, TableIdentifier table) {
-    if (state.containsTable(table)) {
+  private RuntimeException tableNameTaken(CatalogState state, TableIdentifier table) {
+    if (tableThere(state, table)) {
       return new AlreadyExistsException("Table already exists: %s", table);
     }
-    if (state.containsView(table)) {
+    if (viewThere(state, table)) {
       return new AlreadyExistsException("View with same name already exists: %s", table);
     }
     return null;
+  }
+
+  // Whether a table holds the name on state, other than the one of the read this transaction frees
+  // there, which holds it until the record applies
+  private boolean tableThere(CatalogState state, TableIdentifier name) {
+    return state.containsTable(name)
+        && !(frees(name) && java.util.Objects.equals(state.tableId(name), original.tableId(name)));
+  }
+
+  // As tableThere, of a view
+  private boolean viewThere(CatalogState state, TableIdentifier name) {
+    return state.containsView(name)
+        && !(viewFrees(name)
+            && java.util.Objects.equals(state.viewId(name), original.viewId(name)));
   }
 
   /**

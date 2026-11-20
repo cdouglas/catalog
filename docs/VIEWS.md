@@ -462,16 +462,17 @@ and a view's metadata carries its own uuid. What Batavia could add, outside Iceb
   - FileIOCatalog stages `CreateView`, `UpdateView`, `DropView` and `RenameView` into the
     transaction's record (`LogCatalog.stageViewChanges`). Each view must be at the version the
     transaction read. A drop treats files as `dropView` does (V9). An update or create goes
-    inline or to a metadata file, as a view's commit sends it. A view's create or rename takes
-    no name the state before the record holds, though the transaction frees it, and a table
-    takes no name a view held there (errata D29 (txn takes no freed name)).
+    inline or to a metadata file, as a view's commit sends it. A view's create or rename may
+    take a name the transaction frees, of a table or a view, and a table's a name a view held:
+    the record frees a name before it takes it, binding what takes it by the namespace's version
+    (CATALOG_TRANSACTIONS.md).
 - **Tests.** `CatalogTransactionTests` gains view cases. JDBC runs them on V1, REST its refusal,
-  and FileIOCatalog runs them in every `LocalCatalogMode` (`takesNamesItFreesAcrossKinds` false:
-  D29 (txn takes no freed name)). The fault fuzzer's transactions create, replace, set
-  properties on, rename and drop views (`TXN_*_VIEW`), which its model applies net at the
-  commit, each on the version the transaction loaded, refusing the commit where D29 does; the
-  race fuzzer's `CATALOG_TXN` changes a view against racers on that view and on the name it
-  renames it to.
+  and FileIOCatalog runs them in every `LocalCatalogMode`, with names a transaction frees taken
+  by the other kind (`TestCatalogRegressions$TransactionsTakeNamesTheyFree` has the rest). The
+  fault fuzzer's transactions create, replace, set properties on, rename and drop views
+  (`TXN_*_VIEW`), which its model applies net at the commit, each on the version the transaction
+  loaded, renames of both kinds each out of a name before any into it; the race fuzzer's
+  `CATALOG_TXN` changes a view against racers on that view and on the name it renames it to.
 - **Cost.** The baselines' classpath digest changed with `core-perf`, so their packs age again.
   No table commit path changed.
 

@@ -66,14 +66,6 @@ public class GCSFileIOCatalogTransactionTests extends CatalogTransactionTests<Fi
   private static String warehouseLocation;
   private static String uniqTestRun;
 
-  @Override
-  protected boolean takesNamesItFreesAcrossKinds() {
-    // a view's create or rename takes no name the state before the record holds, nor a table a
-    // name a view holds there, though the transaction frees it (errata D29 (txn takes no freed
-    // name))
-    return false;
-  }
-
   /** Whether the catalog inlines TableMetadata. Default off; subclasses opt in. */
   protected boolean inlineTM() {
     return false;

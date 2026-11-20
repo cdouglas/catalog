@@ -661,7 +661,7 @@ class TestCatalogFaultProperties {
      * as their namesakes without TXN_ pick their operands: a create, a replace of its version, a
      * property, a rename and a drop. The commit applies them net, as BaseCatalogTransaction sends
      * them: a view it created as created last, one it had, changed only on the version it first
-     * loaded.
+     * loaded; a create or rename may take a name the transaction frees, of either kind.
      */
     TXN_CREATE_VIEW,
     TXN_REPLACE_VIEW,
@@ -1023,31 +1023,41 @@ class TestCatalogFaultProperties {
   }
 
   /**
-   * Renames each table of {@code renames} from its name to its new one, as LogCatalog stages a
-   * catalog transaction's renames: each out of a name before any into it, so a rename takes a
-   * name another of them frees whatever their order; one into a name still held (a swap) fails.
+   * Renames each table of {@code renames} and each view of {@code viewRenames} from its name to
+   * its new one, as LogCatalog stages a catalog transaction's renames: each out of a name before
+   * any into it, of either kind, so a rename takes a name another of them frees whatever their
+   * order; one into a name still held (a swap) fails. A table and a view share a namespace's
+   * names (VIEWS.md V7).
    */
-  private static void renameAll(
-      Model m, List<Map.Entry<TableIdentifier, TableIdentifier>> renames) {
+  private static void renameAll(Model m, List<Map.Entry<TableIdentifier, TableIdentifier>> renames,
+      List<Map.Entry<TableIdentifier, TableIdentifier>> viewRenames) {
     List<Map.Entry<TableIdentifier, TableIdentifier>> left = new ArrayList<>(renames);
+    left.addAll(viewRenames);
     while (!left.isEmpty()) {
       Map.Entry<TableIdentifier, TableIdentifier> next = left.stream()
-          .filter(r -> !m.containsKey(r.getValue()))
+          .filter(r -> !m.containsKey(r.getValue()) && !m.views.containsKey(r.getValue()))
           .findFirst()
           .orElse(left.get(0));
       left.remove(next);
       TableIdentifier from = next.getKey();
       TableIdentifier to = next.getValue();
-      TableState state = existing(m, from);
-      // a view holds a name a table may not take (VIEWS.md V7): no rename of tables frees it
+      boolean view = viewRenames.contains(next);
+      if (view) {
+        existingView(m, from);
+      } else {
+        existing(m, from);
+      }
       if (m.containsKey(to) || m.views.containsKey(to)) {
         throw new IllegalStateException(to + " exists");
       }
       if (!m.namespaces.containsKey(to.namespace())) {
         throw new IllegalStateException(to.namespace() + " does not exist");
       }
-      m.remove(from);
-      m.put(to, state);
+      if (view) {
+        m.views.put(to, m.views.remove(from));
+      } else {
+        m.put(to, m.remove(from));
+      }
     }
   }
 
@@ -1064,35 +1074,6 @@ class TestCatalogFaultProperties {
     if (model.containsKey(id) || model.views.containsKey(id)
         || !model.namespaces.containsKey(id.namespace())) {
       throw new IllegalStateException("cannot bind " + id);
-    }
-  }
-
-  /**
-   * Fails the effect of a catalog transaction that takes a name the state before its record holds,
-   * as LogCatalog refuses it while errata D29 (txn takes no freed name) stands: a table's create,
-   * or a view's create or rename, into a name a table or view holds there, though the transaction
-   * frees it; a table's rename into a name a view holds there. (A table's rename into a name the
-   * transaction frees of a table binds by the namespace's version: Bug 124 (rename into freed name
-   * fails).) Each name is its holder's at the end of the transaction.
-   */
-  private static void takesNoNameItFrees(Model m, List<TableIdentifier> tablesCreated,
-      List<Map.Entry<TableIdentifier, TableIdentifier>> tableRenames,
-      List<TableIdentifier> viewsTaking) {
-    if (TAKES_NAMES_IT_FREES) {
-      return;
-    }
-    List<TableIdentifier> taken = new ArrayList<>();
-    tablesCreated.stream().filter(t -> m.containsKey(t) || m.views.containsKey(t))
-        .forEach(taken::add);
-    tableRenames.stream().map(Map.Entry::getValue).filter(m.views::containsKey)
-        .forEach(taken::add);
-    viewsTaking.stream().filter(v -> m.containsKey(v) || m.views.containsKey(v))
-        .forEach(taken::add);
-    if (!taken.isEmpty()) {
-      Statistics.label("a transaction refused for taking a name it frees (errata D29)")
-          .collect(taken.size() > 1 ? "names" : "a name");
-      throw new IllegalStateException(
-          "errata D29 (txn takes no freed name): it takes " + taken + ", held before its record");
     }
   }
 
@@ -1183,19 +1164,21 @@ class TestCatalogFaultProperties {
    * A change a writer staged in its open catalog transaction, and its effect at the commit. The
    * commit applies a transaction's changes as LogCatalog stages them, by phase: namespace creates
    * and properties; then the changes to the tables it loaded, each by the catalog's name the
-   * table had when the transaction loaded it; then those tables' renames, net (a name to its
-   * final one); then its creates, with the changes to the tables it created; then its view
-   * changes, net (LogCatalog.stageViewChanges: drops and updates of the views it had, their
-   * renames, and the views it created); then its namespace drops. Within a phase, in the order the
-   * transaction staged them.
+   * table had when the transaction loaded it; then the drops and updates of the views it had
+   * (LogCatalog.stageViewChanges); then the renames of those tables and views, net (a name to its
+   * final one), each out of a name before any into it, of either kind; then its creates, with the
+   * changes to the tables it created; then the views it created; then its namespace drops. Within
+   * a phase, in the order the transaction staged them. So a create or rename takes a name the
+   * transaction frees, of either kind (errata D29 (txn takes no freed name), fixed).
    */
   private static final class Staged {
     static final int NAMESPACES = 0;
     static final int TABLES = 1;
-    static final int RENAMES = 2;
-    static final int CREATES = 3;
-    static final int VIEWS = 4;
-    static final int NAMESPACE_DROPS = 5;
+    static final int VIEWS = 2;
+    static final int RENAMES = 3;
+    static final int CREATES = 4;
+    static final int VIEW_CREATES = 5;
+    static final int NAMESPACE_DROPS = 6;
 
     final String description;
     final int phase;
@@ -1212,12 +1195,6 @@ class TestCatalogFaultProperties {
       return description;
     }
   }
-
-  /**
-   * Whether a catalog transaction's create or rename takes a name the same transaction frees
-   * (errata D29 (txn takes no freed name): not yet).
-   */
-  private static final boolean TAKES_NAMES_IT_FREES = false;
 
   /**
    * The key a kept view a catalog transaction dropped has among the model's kept views until the
@@ -2738,10 +2715,6 @@ class TestCatalogFaultProperties {
             }
           });
           // Its changes in the order the commit applies them (Staged)
-          List<Staged> effects = new ArrayList<>(changes);
-          effects.removeIf(c -> c.phase == Staged.RENAMES);
-          effects.add(new Staged("renames " + renames, Staged.RENAMES,
-              (m, actual) -> renameAll(m, renames)));
           // Its view changes, net, as BaseCatalogTransaction sends them
           List<TxnView> viewChanges = new ArrayList<>();
           w.views.forEach(v -> {
@@ -2749,25 +2722,24 @@ class TestCatalogFaultProperties {
               viewChanges.add(v);
             }
           });
+          List<Map.Entry<TableIdentifier, TableIdentifier>> viewRenames = new ArrayList<>();
+          viewChanges.forEach(v -> {
+            if (v.start != null && !v.dropped && !v.name.equals(v.start)) {
+              viewRenames.add(Map.entry(v.start, v.name));
+            }
+          });
+          List<Staged> effects = new ArrayList<>(changes);
+          effects.removeIf(c -> c.phase == Staged.RENAMES);
+          effects.add(new Staged("renames " + renames + (viewRenames.isEmpty() ? ""
+              : ", views' " + viewRenames), Staged.RENAMES,
+              (m, actual) -> renameAll(m, renames, viewRenames)));
           if (!viewChanges.isEmpty()) {
             effects.add(new Staged("views " + viewChanges, Staged.VIEWS,
-                (m, actual) -> applyViewChanges(m, viewChanges)));
+                (m, actual) -> changeViews(m, viewChanges)));
+            effects.add(new Staged("views created", Staged.VIEW_CREATES,
+                (m, actual) -> createViews(m, viewChanges)));
           }
           effects.sort(java.util.Comparator.comparingInt(c -> c.phase));
-          // The names it takes: its tables' creates (by their names at the end), its tables'
-          // renames, and its views' creates and renames
-          List<TableIdentifier> tablesCreated = new ArrayList<>();
-          w.names.forEach((name, origin) -> {
-            if (origin == null) {
-              tablesCreated.add(name);
-            }
-          });
-          List<TableIdentifier> viewsTaking = new ArrayList<>();
-          viewChanges.forEach(v -> {
-            if (!v.dropped && !v.name.equals(v.start)) {
-              viewsTaking.add(v.name);
-            }
-          });
           // What each purge deletes: the manifests and lists of the table as it is now, just
           // before the commit (Bug 96)
           Map<TableIdentifier, Set<String>> purging = new TreeMap<>(BY_NAME);
@@ -2786,7 +2758,6 @@ class TestCatalogFaultProperties {
                 // All of it, or nothing: the effects apply to the model's copy in the order the
                 // transaction staged them, and any that does not apply fails the whole
                 checkIsolation(txn.isolationLevel(), loaded, m);
-                takesNoNameItFrees(m, tablesCreated, renames, viewsTaking);
                 for (Staged change : effects) {
                   change.effect.apply(m, actual);
                 }
@@ -3021,13 +2992,13 @@ class TestCatalogFaultProperties {
     }
 
     /**
-     * Applies a catalog transaction's view changes, net, to {@code m}, as LogCatalog stages them
-     * (stageViewChanges): a change to a view it had only on the version it first loaded (VIEWS.md
-     * V6), or none of the transaction applies; drops and updates, then renames, then creates. A
-     * kept view's drop ({@code gc.enabled} false) leaves a metadata file to register, which {@link
-     * #resolve} finds once the commit took effect.
+     * Applies a catalog transaction's changes to the views it had, net, to {@code m}, as LogCatalog
+     * stages them (stageViewChanges), but their renames ({@link #renameAll}): each only on the
+     * version it first loaded (VIEWS.md V6), or none of the transaction applies; drops and
+     * updates. A kept view's drop ({@code gc.enabled} false) leaves a metadata file to register,
+     * which {@link #resolve} finds once the commit took effect.
      */
-    private void applyViewChanges(Model m, List<TxnView> changes) {
+    private void changeViews(Model m, List<TxnView> changes) {
       for (TxnView v : changes) {
         if (v.start != null) {
           ViewState now = existingView(m, v.start);
@@ -3038,29 +3009,23 @@ class TestCatalogFaultProperties {
           }
         }
       }
-      List<Map.Entry<TableIdentifier, ViewState>> renamed = new ArrayList<>();
       for (TxnView v : changes) {
         if (v.start == null) {
           continue;
         }
-        ViewState now = m.views.remove(v.start);
         if (v.dropped) {
+          ViewState now = m.views.remove(v.start);
           if (now.kept) {
             m.keptViews.put(KEPT_BY_A_TRANSACTION + v.start, now.copy());
           }
-          continue;
-        }
-        ViewState next = v.updated ? v.current.copy() : now;
-        if (v.name.equals(v.start)) {
-          m.views.put(v.start, next);
-        } else {
-          renamed.add(Map.entry(v.name, next));
+        } else if (v.updated) {
+          m.views.put(v.start, v.current.copy());
         }
       }
-      for (Map.Entry<TableIdentifier, ViewState> rename : renamed) {
-        checkBindable(m, rename.getKey());
-        m.views.put(rename.getKey(), rename.getValue());
-      }
+    }
+
+    /** Adds the views a catalog transaction created, at their names at its end. */
+    private static void createViews(Model m, List<TxnView> changes) {
       for (TxnView v : changes) {
         if (v.start == null) {
           checkBindable(m, v.name);

@@ -998,12 +998,14 @@ A name binds in a namespace by the condition the record names
 The name check is the one `CatalogMutation` makes as it stages: a table's
 or a view's name against the namespace's tables and views, which share one
 set of names (VIEWS.md V7), a namespace's against its parent's children.
-Every action verifies on the state before the record, so a rename into a name
-its own record frees (a `DropTable` of the table there, or a `RenameTable` of
-it out, which the record applies first) goes by `*_version`: by `*_removals`
-the name would be taken (CATALOG_TRANSACTIONS.md). A view takes no name its
-own record frees. A table or a view and a namespace may share a name under
-either condition.
+Every action verifies on the state before the record, so a create or rename
+into a name its own record frees, of a table or a view (a `DropTable` or
+`DropView` of what holds it, or a `RenameTable` or `RenameView` of it out),
+goes by `*_version`: by `*_removals` the name would be taken
+(CATALOG_TRANSACTIONS.md). The record frees a name before it takes it: drops
+first, then updates, then renames, each after any rename out of the name it
+takes, then creates, then namespace drops (`CatalogMutation.intention`). A
+table or a view and a namespace may share a name under either condition.
 The `name` condition is stable (S2, [LOG.md](LOG.md) §"Unconditional
 appends"): namespace ids are never reused, removals only grow, and a taken
 name is freed only by an action that adds to them, so a record it rejects
