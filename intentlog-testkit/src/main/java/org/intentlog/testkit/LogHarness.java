@@ -177,6 +177,15 @@ public interface LogHarness {
   }
 
   /**
+   * Whether a blind append may land void, past the end of the segment it went to, with nothing
+   * telling its sender (docs/LOG_SEGMENTS.md D4): a compaction's PageOuts before the one it reads
+   * through may then not land, and it seals fewer blocks than the paging rule. False by default.
+   */
+  default boolean appendsMayVoid() {
+    return false;
+  }
+
+  /**
    * The log as it stood when a read or write ended at {@code tail}: a checkpoint the log stored
    * at or before it and the records after that through it, read without faults; null if the log
    * never ended there, or if the tail names no position ({@link LogTail#position}). Any checkpoint

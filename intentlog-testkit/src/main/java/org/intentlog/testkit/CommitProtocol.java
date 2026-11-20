@@ -86,8 +86,9 @@ import org.intentlog.wire.UuidV7;
  * docs/COMMITTED_PAGING.md "Testing"): at the clock, inside the inline blocks, inside a block a
  * compaction in flight is sealing, at or below the floor or the horizon, or far ahead. A log may be
  * prefilled with records stamped over the recent past, so that its committed set spans blocks. In
- * runs that page the committed set ({@link Settings#paging}: a threshold of 0, and an admission
- * window A of 0 or 100 ms), compactors and writers page every block but the newest older than A; a
+ * runs that page the committed set ({@link Settings#paging}: an admission window A of 0 or 100
+ * ms, and a threshold T of 0 or {@value #SMALL_THRESHOLD_BYTES} bytes), compactors and writers page
+ * the oldest blocks but the newest older than A while the inline set is larger than T; a
  * compaction is also split around
  * its PageOuts, its pages put at one step ({@link Step#SPLIT}) and its PageOuts landed at a later
  * one, or never: it crashed after the puts ({@link Step#LAND}); orphaned pages are swept at any
@@ -112,11 +113,16 @@ import org.intentlog.wire.UuidV7;
  *       any other error) did not; an error follows an injected fault; a commit nothing raced, on a
  *       log that did not fail, commits (the solo rule, which a writer minting at or below the
  *       floor breaks); and a commit is rejected beyond the floor only if its stamp is A older than
- *       some clock that compacted. Each rejection and unknown outcome is justified by the log as
- *       it is after the commit (versions and marks only grow, so a justification at the moment of
- *       rejection still holds there): a conflict only if the transaction's reads do not hold on
- *       that state; beyond the horizon or the floor only if its id is at or below that mark; an
- *       unknown outcome only after a fault, or for an id at or below the horizon.
+ *       some clock that compacted, and after every step the floor is the horizon or at most the
+ *       latest clock that compacted less A. A whole compaction with no fault seals exactly what
+ *       the paging rule, run here on the set after its GC, seals: while the inline set is larger
+ *       than T, the oldest block, if it is not the newest and its top is at or below the
+ *       compactor's clock less A (the gap plan's B7). Each rejection and unknown outcome is
+ *       justified by the log as it is after the commit (versions and marks only grow, so a
+ *       justification at the moment of rejection still holds there): a conflict only if the
+ *       transaction's reads do not hold on that state; beyond the horizon or the floor only if its
+ *       id is at or below that mark; an unknown outcome only after a fault, or for an id at or
+ *       below the horizon.
  *   <li>A copy of an intention record never applies: the state, committed set and horizon after a
  *       duplicate equal those before it, whether the original is a record, in a checkpoint, paged
  *       or past the GC horizon, and whether it applied or was rejected.
@@ -176,6 +182,9 @@ public final class CommitProtocol {
 
   /** How far apart, on average, a prefilled log's records are stamped. */
   static final long PREFILL_SPACING_MS = 4L;
+
+  /** The page threshold T of half the runs that page: a block or two of ids (16 to a block). */
+  static final long SMALL_THRESHOLD_BYTES = 256L;
 
   public enum Step {
     BEGIN,
@@ -339,10 +348,15 @@ public final class CommitProtocol {
     final long compactorAheadMs;
     final CompactionPolicy policy;
     final String policyName;
-    /** Whether compactions page the committed set, at a threshold of 0. */
+    /** Whether compactions page the committed set. */
     final boolean paging;
     /** The admission window A, in ms, if they do. */
     final long admissionMs;
+    /**
+     * The page threshold T, in bytes, if they do: 0, or {@value #SMALL_THRESHOLD_BYTES} (a block
+     * or two of ids), drawn from the seed's third bit.
+     */
+    final long thresholdBytes;
     /** How many records the log is prefilled with, stamped over the recent past. */
     final int prefill;
     final long seed;
@@ -376,6 +390,7 @@ public final class CommitProtocol {
       this.seed = seed;
       this.tailReads = seed >= 0;
       this.compactAfter = (seed & (1L << 62)) == 0;
+      this.thresholdBytes = paging && (seed & (1L << 61)) != 0 ? SMALL_THRESHOLD_BYTES : 0L;
     }
 
     /** A runtime's configuration in this run, at {@code retentionMs}, on {@code clock}. */
@@ -386,7 +401,7 @@ public final class CommitProtocol {
               Duration.ZERO, clock)
               .withTailReads(tailReads)
               .withCompactionAfterCommit(compactAfter);
-      return paging ? config.withPaging(admissionMs, 0L) : config;
+      return paging ? config.withPaging(admissionMs, thresholdBytes) : config;
     }
 
     @Override
@@ -395,7 +410,7 @@ public final class CommitProtocol {
           "writers=%d faults=%s retention=%s compactor ahead %d ms, compact %s %s%s, %s%s",
           writers, faults, retentionMs == NO_GC ? "none" : retentionMs + " ms", compactorAheadMs,
           policyName, compactAfter ? "after commits" : "with them",
-          paging ? ", paging (A = " + admissionMs + " ms, T = 0)" : "",
+          paging ? ", paging (A = " + admissionMs + " ms, T = " + thresholdBytes + " B)" : "",
           tailReads ? "tail reads" : "whole reads",
           prefill > 0 ? ", prefilled with " + prefill + " records (seed " + seed + ")" : "");
     }
@@ -403,8 +418,9 @@ public final class CommitProtocol {
 
   /**
    * Settings drawn: 2 or 3 writers, GC off or at retention 0, 50 or 200 ms, compaction policies,
-   * paging or not (at an admission window of 0, or of 100 ms), a log prefilled or not, and tail
-   * reads or whole ones.
+   * paging or not (at an admission window of 0, or of 100 ms in two runs of three: at 0 no ceiling
+   * binds, as a block that is not the newest ends below the newest id; and at a threshold of 0 or
+   * {@value #SMALL_THRESHOLD_BYTES} bytes), a log prefilled or not, and tail reads or whole ones.
    */
   public static Arbitrary<Settings> settings() {
     return Combinators.combine(
@@ -413,7 +429,7 @@ public final class CommitProtocol {
             Arbitraries.of(NO_GC, NO_GC, 0L, 50L, 200L),
             Arbitraries.of(0L, 0L, 1_000L),
             Arbitraries.of(-1, 0, 2, 5),
-            Arbitraries.of(-1L, -1L, 0L, 0L, 100L),
+            Arbitraries.of(-1L, -1L, 0L, 100L, 100L),
             Arbitraries.of(0, 24, 48, 48),
             Arbitraries.longs())
         .as(Settings::new);
@@ -690,6 +706,12 @@ public final class CommitProtocol {
     private int splitCount = 0;
     // The latest clock any compaction, split or commit ran on: no block above it less A is sealed
     private long sealingClock = Long.MIN_VALUE;
+    // The context of the last step of maintenance, once it has run
+    private Context lastMaintenance = null;
+    // Whether a page request met a fault since the compaction step began
+    private boolean pageFaulted = false;
+    // The replica the last whole compaction checkpointed
+    private Replica<State> compacted = null;
     // A sweep armed to run at the next write after a put of a page of the history (a compactor's
     // write of the checkpoint that names it), from the replica it holds; null if none
     private Replica<State> armedSweep = null;
@@ -831,6 +853,7 @@ public final class CommitProtocol {
         Statistics.label("page reads").collect(inCommit ? "a commit's" : "another's");
       }
       if (fault != PageFault.NONE) {
+        pageFaulted = true;
         if ((request == PageRequest.GET || statePut) && inCommit) {
           c.faulted = true;
         } else if (request == PageRequest.GET) {
@@ -954,6 +977,7 @@ public final class CommitProtocol {
         Statistics.label("maintenance after a fault").collect(what + " failed");
         return false;
       } finally {
+        lastMaintenance = maintenance;
         maintenance = was;
       }
     }
@@ -970,7 +994,7 @@ public final class CommitProtocol {
       if (whole) {
         trace.append("  compact\n");
         sealingClock = Math.max(sealingClock, now + settings.compactorAheadMs);
-        compactor.compact();
+        compacted = compactor.compact();
         Statistics.label("steps").collect("compact");
         return true;
       }
@@ -1408,12 +1432,18 @@ public final class CommitProtocol {
       pagePlan = settings.faults ? PagePlan.of(cmd.e >> 4) : PagePlan.NONE;
       boolean deletes = pagePlan.request != PageRequest.DELETE;
       boolean[] did = {false};
+      pageFaulted = false;
+      compacted = null;
       try {
         if (!maintain("a compaction", () -> did[0] = compact(whole)) || !did[0]) {
           return;
         }
       } finally {
         pagePlan = PagePlan.NONE;
+      }
+      if (before != null && settings.paging && compacted != null && !lastMaintenance.faulted
+          && !lastMaintenance.preempted && !pageFaulted) {
+        checkPaging(before.committed(), compacted.committed());
       }
       if (before != null && deletes) {
         Set<String> kept = names(oracle.read().committed().pages());
@@ -1423,6 +1453,50 @@ public final class CommitProtocol {
               "page %s, which the compaction's GC record dropped, was not deleted", ref.name());
         }
       }
+    }
+
+    /**
+     * The gap plan's B7: a whole compaction that met no fault, and that no delayed append raced,
+     * sealed exactly what the paging rule seals, run here apart from the runtime's loop on {@code
+     * before} (the set as the step began) after the compaction's GC: while the inline set is
+     * larger than T, the oldest block, if it is not the newest and its top is at or below the
+     * compactor's clock less A ({@code -1}, nothing, while A reaches back past the epoch). On a
+     * log whose blind appends may land void ({@link LogHarness#appendsMayVoid}), a prefix of that:
+     * the PageOuts it sends before the one it reads through may not land, and a later one then
+     * finds its block no longer the oldest.
+     */
+    private void checkPaging(CommittedSet before, CommittedSet after) {
+      long clock = now + settings.compactorAheadMs;
+      CommittedSet set = before;
+      if (settings.retentionMs < clock) {
+        set = set.toBuilder().advanceHorizon(clock - settings.retentionMs).build();
+      }
+      long ceiling = settings.admissionMs >= clock ? -1L : clock - settings.admissionMs;
+      List<String> expected = new ArrayList<>();
+      String stopped;
+      while (true) {
+        if (set.inlineBytes() <= settings.thresholdBytes) {
+          stopped = "the threshold";
+          break;
+        }
+        CommittedSet.Seal seal = set.sealable(ceiling);
+        if (seal == null) {
+          stopped = set.sealable(Long.MAX_VALUE) == null ? "the newest block" : "the ceiling";
+          break;
+        }
+        expected.add(seal.name());
+        set = set.pagedOut(seal.record());
+      }
+      Set<String> had = names(before.pages());
+      List<String> sealed = after.pages().stream().map(PageRef::name)
+          .filter(name -> !had.contains(name)).collect(Collectors.toList());
+      boolean prefix = harness.appendsMayVoid() && sealed.size() < expected.size()
+          && sealed.equals(expected.subList(0, sealed.size()));
+      check(sealed.equals(expected) || prefix, "a compaction at %d (A = %d ms, T = %d B) sealed"
+              + " %s, but the paging rule seals %s, stopping at %s", clock, settings.admissionMs,
+          settings.thresholdBytes, sealed, expected, stopped);
+      Statistics.label("a compaction's paging stopped at").collect(
+          (expected.isEmpty() ? "" : "a seal, then ") + stopped);
     }
 
     /**
@@ -1874,6 +1948,11 @@ public final class CommitProtocol {
       long floor = set.floor();
       Set<UUID> applied = appliedIds(live.state().history());
       check(horizon <= floor, "%s: the horizon %d is above the floor %d", when, horizon, floor);
+      // A floor above the horizon is the top of a block sealed, which no compaction does within A
+      // of its clock (the gap plan's B7)
+      check(floor <= horizon || floor <= sealingClock - settings.admissionMs,
+          "%s: the floor %d is above the horizon %d and above the latest clock that compacted"
+              + " (%d) less A = %d ms", when, floor, horizon, sealingClock, settings.admissionMs);
       Set<UUID> above = select(applied, Long.MAX_VALUE, floor + 1, Long.MAX_VALUE);
       Set<UUID> inline = set.ids();
       check(inline.equals(above), "%s: the inline ids are not those applied above the floor %d:"

@@ -789,8 +789,9 @@ Each stage keeps every suite and fuzzer green, and lands on the branch
      commit's stamp is drawn by region against the marks of the log as it
      starts (the table above, plus `OLDEST`: just above the floor). A log may
      be prefilled with 24 or 48 records stamped over the 100-200 ms before, so
-     its set spans blocks of 16. Runs that page do so at A of 0 or 100 ms and
-     T = 0. New steps: `SPLIT` (a compactor reads, puts the pages it would
+     its set spans blocks of 16. Runs that page do so at A of 0 or 100 ms (100
+     in two of three: at 0 no ceiling binds, a block that is not the newest
+     ending below the newest id) and T of 0 or 256 bytes. New steps: `SPLIT` (a compactor reads, puts the pages it would
      seal) and `LAND` (its PageOuts land later, or it crashes after some or
      none of them); `SWEEP` (`LogRuntime.sweep`, from a writer's replica,
      however stale, or a fresh one); `LOOKUP` (`LogRuntime.committed` of any
@@ -819,7 +820,13 @@ Each stage keeps every suite and fuzzer green, and lands on the branch
      only if the replica had not applied it (nor ever will, at or below its
      floor), and fails only after a page fault; the solo rule, already there;
      and a commit is rejected `BEYOND_FLOOR` only if its stamp is A older than
-     some clock that compacted.
+     some clock that compacted; after every step a floor above the horizon is
+     at most the latest clock that compacted less A; and a whole compaction
+     with no fault seals exactly what the paging rule, run by the fuzzer on
+     the set after its GC, seals (while the inline set is over T, the oldest
+     block if not the newest and its top at or below the clock less A), a
+     prefix of it on the segmented log, whose blind PageOuts before the last
+     may land void (calibration `paging.sh`'s `ignorethreshold`, `pageonce`).
    - Found: a page's node may reach below the floor it was sealed at, into
      the nodes of the pages before it (after a PageOut the remaining blocks
      merge into a parent): a page holds the ids above the page before it, not

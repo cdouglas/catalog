@@ -424,6 +424,11 @@ final class SegmentedLogHarness implements LogHarness {
   }
 
   @Override
+  public boolean appendsMayVoid() {
+    return true;
+  }
+
+  @Override
   public void clock(LongSupplier now) {
     clock.source = now;
   }

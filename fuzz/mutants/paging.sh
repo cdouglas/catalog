@@ -4,7 +4,7 @@
 # floorgapB, absentpage, nodigest, sweepabove, mintH, pageown and missingfail; the rest are
 # mistakes the Java could make that the model has no switch for.
 MUTANTS="nodroppedreplay nodigest nomerge floorgapB pagedabsent gckeepspages absentpage sweepabove
-  pageown mintH nodelete noadmission missingfail"
+  pageown mintH nodelete noadmission missingfail ignorethreshold pageonce"
 # Unreachable from the fuzzers, so no oracle can catch them. newest: no compactor proposes the
 # newest block (pageable() never offers it), so only a forged PageOut reaches pagedOut's check
 # (TestCommittedSetBlocks.theNewestBlockIsNeverSealed forges one). floorgap: the built set's
@@ -67,6 +67,14 @@ mutant() { # name main-dir test-dir (the catalog's; these mutants are intentlog-
     try {" ;;
     # the page ceiling ignores the admission window A
     noadmission) mutate $RT "    return Math.min(window >= now ? -1L : now - window, ceiling);" "    return Math.min(now, ceiling);" ;;
+    # a compaction pages whatever the inline set's size, as at T = 0 (the gap plan's B7: caught
+    # by the paging reference of a compaction at T > 0)
+    ignorethreshold) mutate $RT "    while (set.inlineBytes() > config.pageThresholdBytes()) {" "    while (true) {" ;;
+    # a compaction seals at most one block (B7's reference again)
+    pageonce) mutate $RT "      seals.add(seal);
+      set = set.pagedOut(seal.record());" "      seals.add(seal);
+      set = set.pagedOut(seal.record());
+      break;" ;;
     # TLA+ missingfail: a page found missing fails the lookup at once, without rereads
     missingfail) mutate $RT "        } catch (MissingPage missing) {
           if (rereads >= MAX_PAGE_REREADS) {" "        } catch (MissingPage missing) {
