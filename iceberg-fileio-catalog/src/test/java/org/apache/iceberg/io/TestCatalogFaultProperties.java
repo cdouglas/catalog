@@ -105,7 +105,11 @@ import org.intentlog.wire.LogEnvelope;
  * creates, replaces, property changes, renames and drops) and commit are separate commands, so
  * other writers' operations run in between. A
  * command may also preempt the one before it: it runs to completion just before one of that
- * operation's reads of the catalog or its first conditional write, so the two race. Each writer
+ * operation's reads of the catalog or its first conditional write, so the two race, or at a
+ * request of any kind after that write, which reaches what an operation does once its record
+ * landed (a compaction after the commit, an expiry's cleanup, a purge): a preempted operation
+ * whose effect the catalog then holds is settled as acknowledged first, and must not report a
+ * failure after (the review's A7). Each writer
  * has its own catalog mode (append / CAS / compaction, pointer / inline TM / inline ML), or all
  * writers share one, and binds the names it creates by name or by the namespace's version, as
  * drawn ({@code fileio.catalog.create.condition}). A small limit on inline updates moves tables
@@ -128,7 +132,10 @@ import org.intentlog.wire.LogEnvelope;
  *
  * <p>Tables are created in format v2 or v3. A model holds the namespaces and their
  * properties, and each table's UUID, format version, live data and delete files, properties and
- * added columns. After every operation the catalog, read back without faults, must match it:
+ * added columns. Data and delete files are one-byte objects, written as an engine writes them, and
+ * every file a snapshot of a table reaches through its manifests must exist: a cleanup or a purge
+ * deletes only what nothing reaches (A7). After every operation the catalog, read back without
+ * faults, must match it:
  *
  * <ul>
  *   <li>An acknowledged operation took effect once, and nothing else changed.
@@ -179,7 +186,7 @@ import org.intentlog.wire.LogEnvelope;
  *       loaded fresh. Nor when its operation refreshes and applies itself again on a conflict
  *       (Iceberg's snapshot producers, property updates, expiries and simple transactions; the
  *       catalog's drops, renames and namespace operations), raced or stale: a command preempts
- *       once, before the operation's first write, so its next attempt is unraced. Nor is a catalog
+ *       once, so its attempts after the race are unraced. Nor is a catalog
  *       transaction, unpreempted, when no other writer changed a table it loaded since it loaded
  *       it; nor, before it sends its record, one of a writer that inlines that only appends to
  *       tables inline then and now, whose updates the conflict encoding judges where the record
@@ -227,6 +234,12 @@ class TestCatalogFaultProperties {
    * inline.
    */
   private static final int AZURE_BLOCK_BYTES = 2048;
+
+  /**
+   * A command's preemption point at or past this is late: the request of the command it preempts
+   * {@code preempt - LATE} after that command's first conditional write (the review's A7).
+   */
+  private static final int LATE = 100;
 
   // Retry commits, throttled writes and lost races without sleeping; merge manifests early, so
   // merge appends read them; keep two previous metadata files, so pointer-mode commits delete
@@ -453,6 +466,9 @@ class TestCatalogFaultProperties {
             Tuple.of(1, Kind.TXN_DROP_VIEW),
             Tuple.of(3, Kind.TXN_COMMIT));
     Arbitrary<Integer> small = Arbitraries.integers().between(0, 11);
+    // A preemption point: a request of the command preempted until its first conditional write
+    // (0-4), or at or after it (LATE + k: its k-th request after that write, which reaches its
+    // follow-up work once its record landed: a compaction after it, an expiry's cleanup)
     Arbitrary<Integer> preempt =
         Arbitraries.frequency(
             Tuple.of(12, -1),
@@ -460,7 +476,10 @@ class TestCatalogFaultProperties {
             Tuple.of(2, 1),
             Tuple.of(2, 2),
             Tuple.of(1, 3),
-            Tuple.of(1, 4));
+            Tuple.of(1, 4),
+            Tuple.of(1, LATE),
+            Tuple.of(1, LATE + 1),
+            Tuple.of(1, LATE + 3));
     // b and c together, and the read and plain faults: a combinator takes at most eight
     // arbitraries
     Arbitrary<int[]> operands = Combinators.combine(small, small).as((b, c) -> new int[] {b, c});
@@ -835,7 +854,8 @@ class TestCatalogFaultProperties {
       // the faults too, when there are any, so that a failing sample can be replayed
       return String.format(
           "w%d:%s(%d,%d,%d%s)%s%s",
-          writer, kind, a, b, c, fresh ? ",fresh" : "", preempt >= 0 ? "@" + preempt : "",
+          writer, kind, a, b, c, fresh ? ",fresh" : "",
+          preempt >= LATE ? "@late" + (preempt - LATE) : preempt >= 0 ? "@" + preempt : "",
           writeFaults != 0 || readFault != 0 || plainFault != 0 || pageFault != 0
               ? "!" + writeFaults + "/" + readFault + "/" + plainFault + "/" + pageFault : "");
     }
@@ -1442,6 +1462,8 @@ class TestCatalogFaultProperties {
     // committed snapshot never changes, whether its list is inline or a file, and whichever writer
     // reads it.
     private final Map<String, Map<Long, List<String>>> manifestLists = new HashMap<>();
+    // the data and delete files each manifest reaches (liveFiles), by its path
+    private final Map<String, List<String>> manifestFiles = new HashMap<>();
     // Each table's storage at the last check, by UUID: inline or a metadata file.
     private final Map<String, String> storage = new HashMap<>();
     // Each data file's first row id, and the snapshot of main it was last seen in, by table UUID:
@@ -1461,6 +1483,11 @@ class TestCatalogFaultProperties {
     private Cmd pending; // the command that may preempt the running one
     private int requests; // reads of the catalog and conditional writes, until the first write
     private boolean wrote;
+    private int lateRequests; // requests of any kind after the first conditional write
+    // The top-level command's operation, while it runs, and whether a late preemption found its
+    // effect in the catalog and settled it then (settleEarly)
+    private Op runningOp;
+    private boolean settled;
     private List<Fault> writePlan;
     private int writes;
     private int failingRead;
@@ -1853,6 +1880,8 @@ class TestCatalogFaultProperties {
     private void runTopLevel(Cmd cmd) {
       requests = 0;
       wrote = false;
+      lateRequests = 0;
+      settled = false;
       writes = 0;
       reads = 0;
       fired.clear();
@@ -1883,6 +1912,8 @@ class TestCatalogFaultProperties {
       if (!wrote) {
         preemptAt(requests++);
         wrote = true;
+      } else {
+        preemptLate();
       }
       Fault fault = writes < writePlan.size() ? writePlan.get(writes) : Fault.NONE;
       if (fault != Fault.NONE) {
@@ -1898,6 +1929,8 @@ class TestCatalogFaultProperties {
       }
       if (location.equals(CATALOG_LOCATION) && !wrote) {
         preemptAt(requests++);
+      } else if (wrote) {
+        preemptLate();
       }
       if (location.endsWith(".metadata.json")) {
         return ReadFault.NONE; // Iceberg retries these after 100 ms
@@ -1919,6 +1952,9 @@ class TestCatalogFaultProperties {
         boolean page) {
       if (!armed || Thread.currentThread() != owner) {
         return Fault.NONE;
+      }
+      if (wrote) {
+        preemptLate();
       }
       PlainClass of;
       switch (request) {
@@ -2010,6 +2046,74 @@ class TestCatalogFaultProperties {
       }
     }
 
+    /**
+     * Runs the pending command at the running one's request after its first conditional write that
+     * it names, if any ({@link #LATE}). The running command's record may have landed by then: if
+     * the catalog holds its effect, it is settled first, as acknowledged ({@link #settleEarly}), so
+     * the pending command is judged on a model that holds it.
+     */
+    private void preemptLate() {
+      if (pending == null || pending.kind == Kind.SWEEP || pending.preempt < LATE) {
+        return;
+      }
+      int request = lateRequests++;
+      if (pending.preempt - LATE != request) {
+        return;
+      }
+      armed = false;
+      try {
+        settleEarly();
+      } finally {
+        armed = true;
+      }
+      Statistics.label("a late preemption's command")
+          .collect(running.kind + (settled ? ", landed" : ", not landed"));
+      runPending("at request #" + request + " after its first write"
+          + (settled ? ", its record landed" : ""));
+    }
+
+    /**
+     * Settles the running command as acknowledged now if its record has landed: the catalog changed
+     * since the last check (a table's metadata, which the model does not hold all of, or what the
+     * model holds), and holds the model with its effect. Otherwise the catalog must be as the last
+     * check left it, and the model's.
+     */
+    private void settleEarly() {
+      Model now = actual();
+      Model with = copy(model);
+      String applies = null;
+      try {
+        runningOp.effect.apply(with, now);
+      } catch (IllegalStateException e) { // an IsolationViolation too
+        applies = notApplied(e);
+      }
+      String withDiff = applies != null ? applies : diff(with, now);
+      String withoutDiff = diff(model, now);
+      boolean changed = withoutDiff != null || !sameMetadata(lastActual, now);
+      if (!changed) {
+        return; // not landed yet
+      }
+      check(withDiff == null, "%s changed the catalog after its first write, but not as its effect"
+          + " would (%s): %s", runningOp, withDiff,
+          withoutDiff != null ? withoutDiff : "the metadata of a table changed");
+      trace.append("    (its record landed: settled as acknowledged)\n");
+      resolve(running, runningOp, Outcome.ACKNOWLEDGED, "", null, false, fired.isEmpty());
+      settled = true;
+    }
+
+    /** Whether the two checks found the same tables with the same metadata. */
+    private static boolean sameMetadata(Model a, Model b) {
+      if (!a.keySet().equals(b.keySet())) {
+        return false;
+      }
+      for (Map.Entry<TableIdentifier, TableState> e : a.entrySet()) {
+        if (!Objects.equals(e.getValue().json, b.get(e.getKey()).json)) {
+          return false;
+        }
+      }
+      return true;
+    }
+
     private void runPending(String where) {
       Cmd nested = pending;
       pending = null;
@@ -2039,9 +2143,19 @@ class TestCatalogFaultProperties {
       return value.toString();
     }
 
+    /**
+     * Writes the one-byte object a data or delete file names, as an engine writes a file before it
+     * commits it, so a delete of a file a snapshot still reaches shows (the review's A7). Not a
+     * request the faults reach: the engine's, not the catalog's.
+     */
+    private String written(String path) {
+      io.seed(path, new byte[] {1});
+      return path;
+    }
+
     private DataFile newFile() {
       return DataFiles.builder(PartitionSpec.unpartitioned())
-          .withPath("mem:///data/f" + nextFile++ + ".parquet")
+          .withPath(written("mem:///data/f" + nextFile++ + ".parquet"))
           .withFileSizeInBytes(10)
           .withRecordCount(1)
           .build();
@@ -2348,8 +2462,9 @@ class TestCatalogFaultProperties {
                 Table table = handle(w, id, cmd.fresh);
                 dv[0] = referenced != null
                     && ((HasTableOperations) table).operations().current().formatVersion() >= 3;
-                deletePath[0] = "mem:///data/" + (referenced == null ? "eq" : dv[0] ? "dv" : "pos")
-                    + deleteFile + (dv[0] ? ".puffin" : ".parquet");
+                deletePath[0] = written("mem:///data/"
+                    + (referenced == null ? "eq" : dv[0] ? "dv" : "pos") + deleteFile
+                    + (dv[0] ? ".puffin" : ".parquet"));
                 org.apache.iceberg.FileMetadata.Builder delete =
                     org.apache.iceberg.FileMetadata.deleteFileBuilder(table.spec())
                         .withPath(deletePath[0])
@@ -3915,6 +4030,9 @@ class TestCatalogFaultProperties {
         return;
       }
       String indent = topLevel ? "" : "    ";
+      if (topLevel) {
+        runningOp = op;
+      }
       trace.append(String.format("%sw%d %s%n", indent, w.id, op));
       Outcome outcome;
       String reason = "";
@@ -4006,6 +4124,19 @@ class TestCatalogFaultProperties {
       if (cmd.kind == Kind.SWEEP && !topLevel) {
         // No change to a table, and it may run after the record of the command it preempts landed
         // (in the compaction after it): that command's check reads the catalog after both
+        return;
+      }
+      if (topLevel && settled) {
+        // Its effect landed before the command that preempted it ran, and was settled then: it
+        // took effect, and what it did after (a cleanup, a compaction) changes nothing modeled
+        check(outcome == Outcome.ACKNOWLEDGED || outcome == Outcome.UNKNOWN,
+            "%s reported %s (%s), but took effect before a later command ran", op, outcome,
+            reason);
+        Model after = actual();
+        String changed = diff(model, after);
+        check(changed == null, "%s, settled when its effect landed, then changed the catalog: %s",
+            op, changed);
+        lastActual = after;
         return;
       }
       // A preempting command runs without faults, and nothing preempts it
@@ -4289,6 +4420,25 @@ class TestCatalogFaultProperties {
      * row ids are missing or overlap, or if a catalog file written since the last check differs
      * from a checkpoint of it.
      */
+    /**
+     * The data or delete files {@code manifest} reaches (its entries but those it deletes), read
+     * once: a manifest never changes.
+     */
+    private List<String> liveFiles(ManifestFile manifest, Map<Integer, PartitionSpec> specs) {
+      return manifestFiles.computeIfAbsent(manifest.path(), path -> {
+        List<String> files = new ArrayList<>();
+        try (CloseableIterable<? extends org.apache.iceberg.ContentFile<?>> entries =
+            manifest.content() == org.apache.iceberg.ManifestContent.DATA
+                ? org.apache.iceberg.ManifestFiles.read(manifest, io, specs)
+                : org.apache.iceberg.ManifestFiles.readDeleteManifest(manifest, io, specs)) {
+          entries.forEach(file -> files.add(file.location()));
+        } catch (java.io.IOException e) {
+          throw new java.io.UncheckedIOException(e);
+        }
+        return files;
+      });
+    }
+
     private Model actual() {
       checkCheckpoints();
       Model tables = new Model();
@@ -4368,6 +4518,13 @@ class TestCatalogFaultProperties {
               check(io.newInputFile(manifest.path()).exists(),
                   "%s: snapshot %d references missing manifest %s",
                   id, snapshot.snapshotId(), manifest.path());
+              // and every data and delete file it reaches (A7: an expiry's or a purge's cleanup
+              // must spare the files a snapshot still reaches)
+              for (String reached : liveFiles(manifest, metadata.specsById())) {
+                check(io.newInputFile(reached).exists(),
+                    "%s: snapshot %d reaches %s through manifest %s, but the file is gone", id,
+                    snapshot.snapshotId(), reached, manifest.path());
+              }
               check(metadata.specsById().containsKey(manifest.partitionSpecId()),
                   "%s: snapshot %d has manifest %s of partition spec %d, which the table does not "
                       + "have", id, snapshot.snapshotId(), manifest.path(),
