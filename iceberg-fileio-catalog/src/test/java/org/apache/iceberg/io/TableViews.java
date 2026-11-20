@@ -342,6 +342,22 @@ final class TableViews {
    * once it has one, and the files' ranges are disjoint below the next row id.
    */
   static Map<String, String> logical(Table table, int earlier, long nextRowIdBefore) {
+    List<Snapshot> all = ((HasTableOperations) table).operations().current().snapshots();
+    java.util.Set<Long> ids = new java.util.HashSet<>();
+    for (int i = 0; i < Math.min(earlier, all.size()); i++) {
+      ids.add(all.get(i).snapshotId());
+    }
+    return logical(table, ids, nextRowIdBefore);
+  }
+
+  /**
+   * As {@link #logical(Table, int, long)}, the snapshots before the commit compared named by id
+   * ({@code earlier}, the table's snapshots then): a count by position shifts when the commit
+   * removes an earlier snapshot (an expiry in a transaction), and a paged table's history need
+   * not count alike at that point.
+   */
+  static Map<String, String> logical(
+      Table table, java.util.Set<Long> earlier, long nextRowIdBefore) {
     TableMetadata metadata = ((HasTableOperations) table).operations().current();
     Map<String, String> items = new TreeMap<>();
     List<Snapshot> snapshots = metadata.snapshots();
@@ -370,7 +386,8 @@ final class TableViews {
           "seq=%d parent=%s op=%s schema=%s%s summary=%s",
           s.sequenceNumber(), s.parentId() == null ? null : "#" + position.get(s.parentId()),
           s.operation(), s.schemaId(),
-          i < earlier ? " first-row-id=" + s.firstRowId() + " added-rows=" + s.addedRows() : "",
+          earlier.contains(s.snapshotId())
+              ? " first-row-id=" + s.firstRowId() + " added-rows=" + s.addedRows() : "",
           summary));
       items.put(String.format("snapshot %02d changes", i), changes(table, s));
     }
@@ -518,13 +535,16 @@ final class TableViews {
    * path. A file written before the table's upgrade to v3 takes ids in the first v3 commit of each
    * branch that keeps it, so on two branches it can have two. Tables before v3 have no row ids.
    */
-  private static void rowIds(Table table, TableMetadata metadata, int earlier,
+  private static void rowIds(Table table, TableMetadata metadata, java.util.Set<Long> earlier,
       long nextRowIdBefore, Map<String, String> items) {
     if (metadata.formatVersion() < 3) {
       items.put("row ids", "none");
       return;
     }
     Map<Long, Map<String, Long>> given = new HashMap<>(); // each snapshot's files' ids, by path
+    // what each compared snapshot (one not in earlier) printed for its files' ids, by path: a later
+    // one that keeps an id it gave prints the same (a compared commit's ids depend on its layout)
+    Map<Long, Map<String, String>> printed = new HashMap<>();
     Map<String, org.apache.iceberg.DataFile> assigned = new TreeMap<>(); // by path and id
     String violation = null;
     List<Snapshot> snapshots = metadata.snapshots();
@@ -533,19 +553,28 @@ final class TableViews {
       Map<String, Long> parent =
           snapshot.parentId() != null ? given.get(snapshot.parentId()) : null;
       Map<String, Long> mine = new HashMap<>();
+      Map<String, String> labels = new HashMap<>();
+      Map<String, String> parentLabels =
+          snapshot.parentId() != null ? printed.get(snapshot.parentId()) : null;
       List<String> ids = new ArrayList<>();
       for (org.apache.iceberg.DataFile file : liveDataFiles(table, snapshot)) {
         String path = file.location();
         Long first = file.firstRowId();
         Long was = parent != null ? parent.get(path) : null;
         mine.put(path, first);
-        if (i < earlier || first == null) {
-          ids.add(path + "=" + first);
+        String label;
+        if (earlier.contains(snapshot.snapshotId()) || first == null) {
+          label = String.valueOf(first);
+        } else if (was != null && first.equals(was) && parentLabels != null
+            && parentLabels.containsKey(path)) {
+          label = parentLabels.get(path); // kept from a compared snapshot: as it printed it
         } else if (was != null) {
-          ids.add(path + "=" + (first.equals(was) ? first : first + " (was " + was + ")"));
+          label = first.equals(was) ? String.valueOf(first) : first + " (was " + was + ")";
         } else {
-          ids.add(path + (first >= nextRowIdBefore ? "=fresh" : "=stale " + first));
+          label = first >= nextRowIdBefore ? "fresh" : "stale " + first;
         }
+        labels.put(path, label);
+        ids.add(path + "=" + label);
         if (was != null && !was.equals(first) && violation == null) {
           violation = "a snapshot changed the row ids its parent gave: " + path;
         }
@@ -554,6 +583,9 @@ final class TableViews {
         }
       }
       given.put(snapshot.snapshotId(), mine);
+      if (!earlier.contains(snapshot.snapshotId())) {
+        printed.put(snapshot.snapshotId(), labels);
+      }
       ids.sort(String::compareTo);
       items.put(String.format("snapshot %02d row ids", i), ids.toString());
     }

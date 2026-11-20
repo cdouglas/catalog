@@ -33,6 +33,7 @@ import net.jqwik.api.RandomDistribution;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DataFiles;
 import org.apache.iceberg.HasTableOperations;
+import org.apache.iceberg.TableMetadata;
 import org.apache.iceberg.PartitionField;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
@@ -294,6 +295,8 @@ final class TableScript {
     private boolean inTransaction = false;
     // Whether a data command adds one to three files, by its a (severalFiles)
     private boolean severalFiles = false;
+    // Whether a transaction with a member that changed nothing is not applicable (noOpMembers)
+    private boolean refuseNoOpMembers = false;
 
     /**
      * Creates the tables, in {@code formatVersion}, partitioned by cat if {@code partitioned}.
@@ -343,6 +346,24 @@ final class TableScript {
     /** The catalog this runner commits through. */
     Catalog catalog() {
       return catalog;
+    }
+
+    /**
+     * Has a transaction with a member that left the transaction's table as it was (a property
+     * removed that it lacked, the sort order it had) not apply ({@link NotApplicable}), if {@code
+     * refuse}. Its record carries nothing of that member, so a merge where it lands leaves the
+     * table there as it is, where Iceberg's {@code BaseTransaction} retry commits the member again
+     * on the table as it is, with effect (or fails, a schema update made on the stale table): no
+     * catalog that judges records can do as that retry does. The rebase oracle's R refuses them.
+     */
+    Runner refusingNoOpMembers(boolean refuse) {
+      this.refuseNoOpMembers = refuse;
+      return this;
+    }
+
+    private static TableMetadata metadataOf(Table t) {
+      return t instanceof HasTableOperations ? ((HasTableOperations) t).operations().current()
+          : null;
     }
 
     /**
@@ -405,6 +426,7 @@ final class TableScript {
           Table target = txn != null ? txn.table() : catalogTxn.asCatalog().loadTable(ID);
           Table second = txn != null ? target : catalogTxn.asCatalog().loadTable(OTHER);
           int staged = 0;
+          Cmd noOp = null;
           long tried = commitsTried();
           inTransaction = true;
           try {
@@ -414,9 +436,14 @@ final class TableScript {
                   || member.kind == Kind.REPLACE || member.kind == Kind.STALE) {
                 continue;
               }
+              Table onto = i % 2 == 1 ? second : target;
+              TableMetadata was = refuseNoOpMembers ? metadataOf(onto) : null;
               try {
-                run(member, i % 2 == 1 ? second : target);
+                run(member, onto);
                 staged += 1;
+                if (was != null && was == metadataOf(onto)) {
+                  noOp = member;
+                }
               } catch (RuntimeException e) {
                 // A transaction's table also refuses snapshot management and scans (Iceberg's
                 // BaseTransaction.TransactionTable): the member does not apply there
@@ -438,6 +465,10 @@ final class TableScript {
           }
           if (staged == 0) {
             throw new NotApplicable("no member staged");
+          }
+          if (noOp != null) {
+            throw new NotApplicable(
+                noOp + " changed nothing in the transaction (refusingNoOpMembers)");
           }
           if (txn != null) {
             txn.commitTransaction();

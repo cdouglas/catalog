@@ -344,7 +344,7 @@ class TestRebaseProperties {
       @ForAll boolean partitioned,
       @ForAll("inlineManifestModes") LocalCatalogMode mode,
       @ForAll("prefixes") List<TableScript.Cmd> prefix,
-      @ForAll("dataWindows") List<TableScript.Cmd> window,
+      @ForAll("mergedWindows") List<TableScript.Cmd> window,
       @ForAll("innerWindows") List<TableScript.Cmd> inner,
       @ForAll("dataSteps") List<TableScript.Cmd> r,
       @ForAll boolean merging,
@@ -1444,6 +1444,18 @@ class TestRebaseProperties {
     return TableScript.commands(TestRebaseProperties::single).withoutEdgeCases();
   }
 
+  /**
+   * Windows of data commits, or of any single command, whose last step (the one an inner racer
+   * races) is not an expiry: an expiry merged onto a changed table removes what it chose on its
+   * base, where Iceberg's retry chooses again (errata D17), so a retry is no reference for it
+   * ({@link Run#expiryReference} is R's).
+   */
+  @Provide
+  Arbitrary<List<TableScript.Cmd>> mergedWindows() {
+    return dataWindows().filter(
+        w -> w.get(w.size() - 1).kind != TableScript.Kind.EXPIRE_SNAPSHOTS);
+  }
+
   /** One or two data commits (appends, validated commits): an inner window. */
   @Provide
   Arbitrary<List<TableScript.Cmd>> innerWindows() {
@@ -1716,6 +1728,7 @@ class TestRebaseProperties {
         writer.run(step);
         lookAtClock();
       }
+      writer.refusingNoOpMembers(true); // R's transaction: its retry re-applies every member
       List<List<TableScript.Cmd>> steps = TableScript.steps(window);
       List<TableScript.Runner> racers = racers(io, mode, writers, steps.size(), merging, trace);
       // the inner racer: a catalog of its own, so its commit runs inside another writer's
@@ -1801,12 +1814,19 @@ class TestRebaseProperties {
       TableMetadata compared = beforeMerged[0] != null ? beforeMerged[0] : beforeR[0];
       Run run = new Run(io, failure, raced[0], raced[0] && !before[0].equals(after[0]), conflicts,
           reasons,
-          TableViews.logical(reader(io).loadTable(TableScript.ID),
-              compared.snapshots().size(), compared.nextRowId()),
+          TableViews.logical(reader(io).loadTable(TableScript.ID), ids(compared),
+              compared.nextRowId()),
           keptOlderFiles(io, beforeR[0]));
       run.lastStep = innerRacer == null ? null
           : lastStep[0] != null ? lastStep[0] : "R wrote nothing, so no window ran";
       return run;
+    }
+
+    /** The ids of the snapshots {@code metadata} holds: those a view compares exactly. */
+    private static java.util.Set<Long> ids(TableMetadata metadata) {
+      java.util.Set<Long> ids = new java.util.HashSet<>();
+      metadata.snapshots().forEach(s -> ids.add(s.snapshotId()));
+      return ids;
     }
 
     /** The conflicts {@code catalog} counted by reason, numbers masked. */
@@ -1914,6 +1934,7 @@ class TestRebaseProperties {
       List<List<TableScript.Cmd>> steps = TableScript.steps(window);
       List<TableScript.Runner> racers =
           racers(io, mode, writers, steps.size(), merging, new StringBuilder());
+      TableMetadata afterInner = null;
       for (int i = 0; i < steps.size(); i++) {
         if (i == steps.size() - 1 && !inner.isEmpty()) { // the inner racer's commit landed first
           TableScript.Runner innerRacer = new TableScript.Runner(
@@ -1923,6 +1944,7 @@ class TestRebaseProperties {
             innerRacer.run(step);
             lookAtClock();
           }
+          afterInner = current(io);
         }
         racers.get(i).run(steps.get(i));
         lookAtClock();
@@ -1955,9 +1977,10 @@ class TestRebaseProperties {
       } catch (RuntimeException e) {
         failure = e;
       }
+      TableMetadata compared = afterInner != null ? afterInner : beforeR;
       return new Run(io, failure, true, true, 0, Map.of(),
-          TableViews.logical(reader(io).loadTable(TableScript.ID),
-              beforeR.snapshots().size(), beforeR.nextRowId()), false);
+          TableViews.logical(reader(io).loadTable(TableScript.ID), ids(compared),
+              compared.nextRowId()), false);
     }
 
     private static java.util.Set<Long> sequenceNumbers(TableMetadata metadata) {
