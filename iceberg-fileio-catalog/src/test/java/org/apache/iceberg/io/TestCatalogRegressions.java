@@ -1258,6 +1258,35 @@ public class TestCatalogRegressions {
     }
 
     /**
+     * A table the transaction creates and then renames is created under its last name only: the
+     * commit names no rename of it (BaseCatalogTransaction sends a created table net), so another
+     * writer's table that took its first name since stays as it is, and nothing needs that name
+     * free at the commit. (Round p19-r0: the fault fuzzer's model created and renamed it as
+     * staged, and found the first name taken.)
+     */
+    @ParameterizedTest
+    @EnumSource(names = {"APPEND", "CAS", "MEMLOG", "AZLOG", "CAS_TM", "APPEND_ML"})
+    void aTableCreatedAndRenamedIsCreatedUnderItsLastName(LocalCatalogMode mode) {
+      LogCatalog catalog = mode.catalog(io, WAREHOUSE, "c", Map.of());
+      catalog.createNamespace(ns);
+      TableIdentifier u = TableIdentifier.of(ns, "u");
+
+      CatalogTransaction txn = catalog.createTransaction(CatalogTransaction.IsolationLevel.SNAPSHOT);
+      txn.asCatalog().buildTable(t, SCHEMA).withProperty("by", "txn").create();
+      txn.asCatalog().renameTable(t, u);
+      // another writer creates t after the transaction staged its create there
+      mode.catalog(io, WAREHOUSE, "c", Map.of())
+          .buildTable(t, SCHEMA).withProperty("by", "other").create();
+      txn.commitTransaction();
+
+      LogCatalog reader = mode.catalog(io, WAREHOUSE, "c", Map.of());
+      assertThat(reader.listTables(ns)).containsExactlyInAnyOrder(t, u);
+      assertThat(reader.loadTable(t).properties()).containsEntry("by", "other");
+      assertThat(reader.loadTable(u).properties()).containsEntry("by", "txn");
+      mode.assertCommitPolicy(io);
+    }
+
+    /**
      * A view dropped and a table created of its name, and a table renamed away and a view created
      * of its name; then a chain of renames across kinds, each into the name the next frees: the
      * view w to the table's name t, the table t to v.

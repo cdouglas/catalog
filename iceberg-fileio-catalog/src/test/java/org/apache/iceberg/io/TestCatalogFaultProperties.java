@@ -1350,6 +1350,21 @@ class TestCatalogFaultProperties {
    */
   private static final String KEPT_BY_A_TRANSACTION = "dropped kept by a transaction: ";
 
+  /**
+   * A table a catalog transaction created, under the name it has in the transaction: the commit
+   * creates it there, as BaseCatalogTransaction sends a created table, net of its renames (a
+   * CatalogCommit names no rename of a table it creates). The names it passed through need not be
+   * free at the commit, as a loaded table's need not ({@link #renameAll}); what the transaction
+   * staged on it applies to it wherever it ends.
+   */
+  private static final class TxnCreated {
+    TableIdentifier name;
+
+    TxnCreated(TableIdentifier name) {
+      this.name = name;
+    }
+  }
+
   /** The UUID the model gives a table a catalog transaction creates, until its commit lands. */
   private static final String CREATED_IN_TXN = "created in a transaction ";
 
@@ -1368,6 +1383,8 @@ class TestCatalogFaultProperties {
     // Each name the transaction resolves to a table it holds, to the catalog's name that table had
     // when the transaction loaded it; a table it created, to null
     final Map<TableIdentifier, TableIdentifier> names = new HashMap<>();
+    // The tables it created, by the names they have in it
+    final Map<TableIdentifier, TxnCreated> created = new HashMap<>();
     // The tables it drops with purge, and keeping their files, by the catalog's names; the
     // namespaces it created
     final List<TableIdentifier> purging = new ArrayList<>();
@@ -1394,6 +1411,7 @@ class TestCatalogFaultProperties {
       loaded.clear();
       staged.clear();
       names.clear();
+      created.clear();
       purging.clear();
       keeping.clear();
       createdNamespaces.clear();
@@ -3147,10 +3165,12 @@ class TestCatalogFaultProperties {
               at.changed = true;
               at.updated = true;
             }
-            TableIdentifier appendTo = at != null ? w.names.get(id) : id;
+            TableIdentifier appendTo = at != null ? w.names.get(id) : null;
+            TxnCreated appendToCreated = at != null ? null : w.created.get(id);
             return new Staged("append " + staged.location() + " to " + id,
                 at != null ? Staged.TABLES : Staged.CREATES,
-                (m, actual) -> existing(m, appendTo).files.add(staged.location()));
+                (m, actual) -> existing(m, appendTo != null ? appendTo : appendToCreated.name)
+                    .files.add(staged.location()));
           });
         case TXN_READ:
           if (w.txn == null) {
@@ -3227,10 +3247,15 @@ class TestCatalogFaultProperties {
             w.txn.asCatalog().renameTable(id, txnTo);
             TableIdentifier renameOf = w.names.remove(id);
             w.names.put(txnTo, renameOf);
-            // A table it loaded is renamed at the commit from its name then to its last (net);
-            // one it created, in its creates' phase, as staged
-            return new Staged("rename " + id + " to " + txnTo,
-                renameOf != null ? Staged.RENAMES : Staged.CREATES, (m, actual) -> {
+            if (renameOf == null) {
+              // One it created is created under its last name (TxnCreated)
+              TxnCreated moved = w.created.remove(id);
+              moved.name = txnTo;
+              w.created.put(txnTo, moved);
+              return new Staged("rename " + id + " to " + txnTo, Staged.CREATES, (m, actual) -> {});
+            }
+            // A table it loaded is renamed at the commit from its name then to its last (net)
+            return new Staged("rename " + id + " to " + txnTo, Staged.RENAMES, (m, actual) -> {
               TableState state = existing(m, id);
               if (m.containsKey(txnTo) || m.views.containsKey(txnTo)) {
                 throw new IllegalStateException(txnTo + " exists");
@@ -3257,12 +3282,14 @@ class TestCatalogFaultProperties {
                 .withProperty(TableProperties.FORMAT_VERSION, String.valueOf(txnVersion))
                 .create();
             w.names.put(txnCreated, null);
+            TxnCreated made = new TxnCreated(txnCreated);
+            w.created.put(txnCreated, made);
             return new Staged("create " + txnCreated, Staged.CREATES, (m, actual) -> {
-              if (m.containsKey(txnCreated) || m.views.containsKey(txnCreated)
-                  || !m.namespaces.containsKey(txnCreated.namespace())) {
-                throw new IllegalStateException("cannot create " + txnCreated);
+              if (m.containsKey(made.name) || m.views.containsKey(made.name)
+                  || !m.namespaces.containsKey(made.name.namespace())) {
+                throw new IllegalStateException("cannot create " + made.name);
               }
-              m.put(txnCreated, new TableState(placeholder, txnVersion));
+              m.put(made.name, new TableState(placeholder, txnVersion));
             });
           });
         case TXN_SET_PROPERTY:
@@ -3280,10 +3307,12 @@ class TestCatalogFaultProperties {
                   at.changed = true;
                   at.updated = true;
                 }
-                TableIdentifier setOn = at != null ? w.names.get(id) : id;
+                TableIdentifier setOn = at != null ? w.names.get(id) : null;
+                TxnCreated setOnCreated = at != null ? null : w.created.get(id);
                 return new Staged("set " + txnPropKey + " on " + id,
                     at != null ? Staged.TABLES : Staged.CREATES,
-                    (m, actual) -> existing(m, setOn).props.put(txnPropKey, txnPropValue));
+                    (m, actual) -> existing(m, setOn != null ? setOn : setOnCreated.name)
+                        .props.put(txnPropKey, txnPropValue));
               });
         case TXN_CREATE_NAMESPACE:
         case TXN_DROP_NAMESPACE:
