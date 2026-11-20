@@ -989,24 +989,33 @@ class TestRebaseProperties {
    * whose rejection says {@code sealed}: R's writer read the table before the window sealed what R
    * builds on. Each rejection it counted for another reason the subject counted as often, and it
    * admits no record the subject rejects.
+   *
+   * <p>A merge's refusals compare as one: which one a record meets first depends on its kind, and
+   * paging may change that (its full updates are smaller, so a table may stay inline where the
+   * subject's moved to a metadata file and went back whole: "merge: pinned" there, a delta's
+   * refusal here; round p22-r0). For the same reason the subject may reject for the kind of its
+   * record ({@link #byKind}) where the twin admits.
    */
   private static String admission(Run unpaged, Run paged, String trace) {
     if (!unpaged.raced || !unpaged.changed) {
       return "not raced";
     }
-    for (Map.Entry<String, Long> rejected : paged.reasons.entrySet()) {
+    Map<String, Long> unpagedByClass = byClass(unpaged.reasons);
+    for (Map.Entry<String, Long> rejected : byClass(paged.reasons).entrySet()) {
       if (!rejected.getKey().startsWith("sealed")
-          && unpaged.reasons.getOrDefault(rejected.getKey(), 0L) < rejected.getValue()) {
+          && unpagedByClass.getOrDefault(rejected.getKey(), 0L) < rejected.getValue()) {
         throw new AssertionError(String.format(
             "the paged twin rejected R's records %d time(s) as \"%s\", the unpaged subject %d:"
                 + " paging may reject only a record that needs a sealed snapshot (rejections:"
                 + " unpaged %s, paged %s)%n%s",
             rejected.getValue(), rejected.getKey(),
-            unpaged.reasons.getOrDefault(rejected.getKey(), 0L), unpaged.reasons, paged.reasons,
+            unpagedByClass.getOrDefault(rejected.getKey(), 0L), unpaged.reasons, paged.reasons,
             trace));
       }
     }
-    if (unpaged.conflicts > paged.conflicts) {
+    long forTheirKind = unpaged.reasons.entrySet().stream()
+        .filter(e -> byKind(e.getKey())).mapToLong(Map.Entry::getValue).sum();
+    if (unpaged.conflicts - forTheirKind > paged.conflicts) {
       throw new AssertionError(String.format(
           "the unpaged subject rejected R's records %d time(s), the paged twin %d: paging admitted"
               + " a record the subject rejects (rejections: unpaged %s, paged %s)%n%s",
@@ -1017,6 +1026,22 @@ class TestRebaseProperties {
           : "rejected unpaged, rejected more paged (sealed)";
     }
     return unpaged.conflicts == 0 ? "admitted alike" : "rejected alike";
+  }
+
+  /** Rejections counted by class: a merge's refusals as one ({@link #admission}). */
+  private static Map<String, Long> byClass(Map<String, Long> reasons) {
+    Map<String, Long> classes = new java.util.TreeMap<>();
+    reasons.forEach((reason, count) ->
+        classes.merge(reason.startsWith("merge:") ? "merge" : reason, count, Long::sum));
+    return classes;
+  }
+
+  /**
+   * Whether {@code reason} rejects a record for its kind, not for what the table holds: one that
+   * is no delta (a full update, a pointer table's), which only its base admits.
+   */
+  private static boolean byKind(String reason) {
+    return reason.equals("merge: pinned") || reason.equals("merge: a pointer table");
   }
 
   @Provide
