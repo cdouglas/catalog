@@ -20,8 +20,9 @@ EQUIVALENT=""
 ORACLES=TestCatalogFaultProperties
 
 prepare() {
-  # 8,000: dropforced fails at try 791 (C8: ten times the margin)
-  tries $1/$T/TestCatalogFaultProperties.java each 8000
+  # 20,000: dropforced failed at try 791 (p19: 728), and passed 8,000 in p21-cal-pagefaults
+  # (b264cf1) as the fault fuzzer's later kinds and preemptions thinned its reach
+  tries $1/$T/TestCatalogFaultProperties.java each 20000
 }
 
 RT=intentlog-core/src/main/java/org/intentlog/LogRuntime.java
