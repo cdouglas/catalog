@@ -3484,6 +3484,13 @@ public class ProtoCodec {
         if (!back.proves(builder.sealedBlockOf(id, back.snapshotId), prefix != null ? prefix : "")) {
           return "sealed: no proof of snapshot " + back.snapshotId;
         }
+        // Its list joins the pool, whose entries never change (Bug 130 (bring-back restates
+        // pooled manifest)): a list from before a v3 upgrade, whose manifest a later inline list
+        // pools with row ids
+        String restated = SnapshotPages.restatedByLeaf(builder, id, back, prefix);
+        if (restated != null) {
+          return "sealed: snapshot " + back.snapshotId + " restates pooled manifest " + restated;
+        }
       }
       Set<Long> back = broughtBackIds();
       if (deltaBytes != null) {

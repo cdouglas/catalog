@@ -1813,8 +1813,12 @@ public class LogCatalog extends BaseMetastoreViewCatalog
             byte[] deltaBytes =
                 InlineDeltaCodec.encodeDelta(delta, metadata.lastUpdatedMillis(), base);
             if (deltaBytes.length <= inline.maxUpdateSize) {
+              List<SnapshotPages.BroughtBack> back = broughtBack(proto, tblId, metadata);
+              if (restatesThePool(proto, tblId, back)) {
+                return toFile(mut, metadata, orFile);
+              }
               mut.updateTableInlineDelta(tableId, deltaBytes);
-              mut.bringingBack(tableId, broughtBack(proto, tblId, metadata));
+              mut.bringingBack(tableId, back);
               evictable(mut, metadata, orFile);
               return true;
             }
@@ -1861,6 +1865,11 @@ public class LogCatalog extends BaseMetastoreViewCatalog
                 : InlineDeltaCodec.encodeDelta(manifests, metadata.lastUpdatedMillis());
         if (fullBytes.length + (manifestBytes != null ? manifestBytes.length : 0)
             <= inline.maxUpdateSize) {
+          List<SnapshotPages.BroughtBack> back =
+              held != null ? broughtBack(proto, tblId, metadata) : List.of();
+          if (restatesThePool(proto, tblId, back)) {
+            return toFile(mut, metadata, orFile);
+          }
           if (manifestBytes != null) {
             mut.updateTableInlineWithManifests(
                 tableId, fullBytes, inline.codec.tag(), manifestBytes);
@@ -1871,7 +1880,7 @@ public class LogCatalog extends BaseMetastoreViewCatalog
             mut.removingSnapshots(tableId, removed);
           }
           if (held != null) {
-            mut.bringingBack(tableId, broughtBack(proto, tblId, metadata));
+            mut.bringingBack(tableId, back);
           }
           if (imported != null) {
             mut.importingBlocks(tableId, imported.put(log.pages(), tblId));
@@ -2038,6 +2047,35 @@ public class LogCatalog extends BaseMetastoreViewCatalog
         }
       }
       return back;
+    }
+
+    /**
+     * Whether the list of a snapshot {@code back} brings inline names a manifest with another entry
+     * than the table's pool holds for it, as {@code proto} holds the table: a list from before the
+     * table's upgrade to v3, whose manifest a later inline list pools with row ids. The pool's
+     * entries never change, so the commit writes a metadata file, as for a list it adds that
+     * would restate one (Bug 130 (bring-back restates pooled manifest); replay refuses the record).
+     */
+    private static boolean restatesThePool(
+        CatalogState proto, Integer tblId, List<SnapshotPages.BroughtBack> back) {
+      if (back.isEmpty()) {
+        return false;
+      }
+      String prefix = proto.allManifestPrefixes().getOrDefault(tblId, "");
+      Map<String, ManifestFile> pool = proto.manifestPool(tblId);
+      for (SnapshotPages.BroughtBack brought : back) {
+        SnapshotPages.Leaf leaf = SnapshotPages.decodeLeaf(brought.leaf, prefix);
+        if (leaf.manifests == null) {
+          continue;
+        }
+        for (ManifestFile manifest : leaf.manifests) {
+          ManifestFile pooled = pool.get(manifest.path());
+          if (pooled != null && !CatalogState.Builder.samePoolEntry(pooled, manifest)) {
+            return true;
+          }
+        }
+      }
+      return false;
     }
 
     /**

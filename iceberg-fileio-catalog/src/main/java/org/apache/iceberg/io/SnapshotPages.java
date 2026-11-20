@@ -554,6 +554,27 @@ final class SnapshotPages {
   }
 
   /**
+   * The path of a manifest the list of the snapshot {@code back} brings inline names with another
+   * entry than the pool of table {@code tblId} holds for it, or null: a list from before the
+   * table's upgrade to v3, whose manifest a later inline list pools with row ids (Bug 130
+   * (bring-back restates pooled manifest)). Such a record does not apply, and its writer writes a
+   * metadata file instead.
+   */
+  static String restatedByLeaf(
+      CatalogState.Builder builder, int tblId, BroughtBack back, String prefix) {
+    Leaf leaf = decodeLeaf(back.leaf, prefix != null ? prefix : "");
+    if (leaf.manifests == null) {
+      return null;
+    }
+    for (ManifestFile manifest : leaf.manifests) {
+      if (builder.restatesPooledManifest(tblId, manifest.path(), () -> manifest)) {
+        return manifest.path();
+      }
+    }
+    return null;
+  }
+
+  /**
    * A sealed snapshot a record brings back inline ("Bringing a sealed snapshot back"): its leaf,
    * its place among its block's leaves, and the sibling hashes up to the block's Merkle root, so
    * replay checks it against the root without reading the page.

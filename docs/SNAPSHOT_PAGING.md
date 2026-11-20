@@ -244,6 +244,17 @@ without reading the page:
   record whose proof fails, or whose snapshot has expired since its writer
   read it, does not apply (`sealed: ...`), and its writer retries on a fresh
   read.
+- **The pool.** A snapshot brought back joins the inline lists, whose
+  manifests share one pool entry per path that never changes. Its list can
+  name a manifest the pool holds with another entry. That happens when the
+  list predates the table's upgrade to v3, and a later inline list pools the
+  manifest with row ids (a first row id). That list's own snapshot sealed
+  first, so nothing in the pool held the old entry then. Such a record does
+  not apply (`sealed: snapshot ... restates pooled manifest ...`): replay
+  would otherwise pool the old entry, and the current snapshot's list would
+  read the manifest without its row ids. Its writer, seeing the restatement
+  in its read, writes a metadata file instead, as for a list it adds that
+  would restate the pool (Bug 130 (bring-back restates pooled manifest)).
 
 Any other record that needs a sealed snapshot's content conflicts with the
 same reason: a commit whose parent is sealed (a stale writer, a stale

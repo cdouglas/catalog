@@ -8973,4 +8973,128 @@ public class TestCatalogRegressions {
           cmd(TableScript.Kind.MERGE_APPEND, 11, 11, 0), new int[] {1, 0});
     }
   }
+
+  /**
+   * Bug 130 (bring-back restates pooled manifest): a v3 table's lists give row ids to the data
+   * manifests written before its upgrade (a first-row-id), which the lists from before it lack;
+   * the inline lists share one pool entry per path, so a list that restates one goes to a file.
+   * A snapshot from before the upgrade with an inline list, sealed since (by commits of a writer
+   * whose lists are files), leaves the pool, and a later inline list pools the manifest with row
+   * ids. A tag on the sealed snapshot brought its list back with the manifest's old entry, which
+   * replay pooled in place of the newer one: the current snapshot's list then read the manifest
+   * without its row ids (and the replay check failed: p19-r0 faultA2.2, a TAG_OLD). Its writer
+   * now writes a metadata file, as for any list that restates the pool, and replay refuses a
+   * record that brings one back ({@code sealed: ...}).
+   */
+  @Nested
+  class ABroughtBackListThatRestatesThePool {
+    @Test
+    void aTagOnASnapshotFromBeforeAnUpgrade() throws Exception {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      Map<String, String> paging = Map.of(
+          LogCatalogProperties.SNAPSHOT_BLOCK, "2", LogCatalogProperties.SNAPSHOT_WINDOW, "1");
+      LogCatalog lists = LocalCatalogMode.APPEND_ML.catalog(io, WAREHOUSE, "c", paging);
+      lists.createNamespace(Namespace.of("ns"));
+      TableIdentifier id = TableIdentifier.of("ns", "t");
+      Table table = lists.buildTable(id, SCHEMA)
+          .withProperty(org.apache.iceberg.TableProperties.FORMAT_VERSION, "2")
+          .create();
+      table.newFastAppend().appendFile(dataFile("u0")).commit();
+      long beforeUpgrade = table.currentSnapshot().snapshotId();
+      table.updateProperties().set(org.apache.iceberg.TableProperties.FORMAT_VERSION, "3").commit();
+      // A writer whose lists are files commits until the snapshot from before the upgrade seals
+      LogCatalog files = LocalCatalogMode.APPEND_TM.catalog(io, WAREHOUSE, "c", paging);
+      Table filed = files.loadTable(id);
+      filed.newFastAppend().appendFile(dataFile("u1")).commit();
+      filed.newFastAppend().appendFile(dataFile("u2")).commit();
+      CatalogState state = lists.log().read().state();
+      int tblId = state.tableId(id);
+      assertThat(state.isInlineTable(id)).isTrue();
+      assertThat(state.sealedBlockOf(tblId, beforeUpgrade)).isNotNull();
+      // An inline list after the upgrade pools the old manifest with its row ids
+      Table inline = lists.loadTable(id);
+      inline.newFastAppend().appendFile(dataFile("u3")).commit();
+      Map<String, Long> current = firstRowIds(inline.currentSnapshot(), io);
+      Map<String, Long> old = firstRowIds(inline.snapshot(beforeUpgrade), io);
+      assertThat(current).isNotEqualTo(old);
+
+      lists.loadTable(id).manageSnapshots().createTag("t", beforeUpgrade).commit();
+
+      Table read = LocalCatalogMode.APPEND_ML.catalog(io, WAREHOUSE, "c", paging).loadTable(id);
+      assertThat(read.refs().get("t").snapshotId()).isEqualTo(beforeUpgrade);
+      assertThat(firstRowIds(read.currentSnapshot(), io)).isEqualTo(current);
+      assertThat(firstRowIds(read.snapshot(beforeUpgrade), io)).isEqualTo(old);
+      CheckpointRoundTrip.assertEveryWrite(io);
+    }
+
+    /**
+     * A writer whose commit read the table before the newer entry was pooled (an inline list's
+     * append lands just before its write) finds no restatement and sends the snapshot back:
+     * replay refuses the record as needing a sealed snapshot, and the tag fails as a conflict
+     * (Iceberg commits a ref change once). A tag on a fresh read writes a metadata file.
+     */
+    @Test
+    void aTagThatAnInlineListOvertakesIsRefusedThenWrittenToAFile() throws Exception {
+      InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+      Map<String, String> paging = Map.of(
+          LogCatalogProperties.SNAPSHOT_BLOCK, "2", LogCatalogProperties.SNAPSHOT_WINDOW, "1");
+      LogCatalog lists = LocalCatalogMode.APPEND_ML.catalog(io, WAREHOUSE, "c", paging);
+      lists.createNamespace(Namespace.of("ns"));
+      TableIdentifier id = TableIdentifier.of("ns", "t");
+      Table table = lists.buildTable(id, SCHEMA)
+          .withProperty(org.apache.iceberg.TableProperties.FORMAT_VERSION, "2")
+          .create();
+      table.newFastAppend().appendFile(dataFile("u0")).commit();
+      long beforeUpgrade = table.currentSnapshot().snapshotId();
+      table.updateProperties().set(org.apache.iceberg.TableProperties.FORMAT_VERSION, "3").commit();
+      LogCatalog files = LocalCatalogMode.APPEND_TM.catalog(io, WAREHOUSE, "c", paging);
+      Table filed = files.loadTable(id);
+      filed.newFastAppend().appendFile(dataFile("u1")).commit();
+      filed.newFastAppend().appendFile(dataFile("u2")).commit();
+      Map<String, Long> old = firstRowIds(table.snapshot(beforeUpgrade), io);
+
+      // The tagging writer's commit reads the table; an inline list's append lands just before
+      // its first write
+      LogCatalog stale = LocalCatalogMode.APPEND_ML.catalog(io, WAREHOUSE, "c", paging);
+      Table tagging = stale.loadTable(id);
+      boolean[] raced = {false};
+      List<Map<String, Long>> current = new ArrayList<>();
+      io.injectFaults((location, strategy) -> {
+        if (!raced[0] && location.equals(WAREHOUSE + "/catalog-c")) {
+          raced[0] = true;
+          Table inline = lists.loadTable(id);
+          inline.newFastAppend().appendFile(dataFile("u3")).commit();
+          current.add(firstRowIds(inline.currentSnapshot(), io));
+        }
+        return InMemoryAtomicFileIO.Fault.NONE;
+      });
+      try {
+        assertThatThrownBy(() -> tagging.manageSnapshots().createTag("t", beforeUpgrade).commit())
+            .isInstanceOf(org.apache.iceberg.exceptions.CommitFailedException.class);
+      } finally {
+        io.injectFaults((location, strategy) -> InMemoryAtomicFileIO.Fault.NONE);
+      }
+      assertThat(raced[0]).isTrue();
+      assertThat(current.get(0)).isNotEqualTo(old);
+
+      assertThat(stale.log().counts().conflictReasons().keySet())
+          .anyMatch(reason -> reason.startsWith("sealed: snapshot " + beforeUpgrade
+              + " restates pooled manifest"));
+      stale.loadTable(id).manageSnapshots().createTag("t", beforeUpgrade).commit();
+      Table read = LocalCatalogMode.APPEND_ML.catalog(io, WAREHOUSE, "c", paging).loadTable(id);
+      assertThat(read.refs().get("t").snapshotId()).isEqualTo(beforeUpgrade);
+      assertThat(firstRowIds(read.currentSnapshot(), io)).isEqualTo(current.get(0));
+      assertThat(firstRowIds(read.snapshot(beforeUpgrade), io)).isEqualTo(old);
+      CheckpointRoundTrip.assertEveryWrite(io);
+    }
+
+    /** Each data manifest of {@code snapshot}'s list, by path, with its first row id. */
+    private Map<String, Long> firstRowIds(org.apache.iceberg.Snapshot snapshot, FileIO io) {
+      Map<String, Long> ids = new java.util.TreeMap<>();
+      for (ManifestFile manifest : snapshot.dataManifests(io)) {
+        ids.put(manifest.path(), manifest.firstRowId());
+      }
+      return ids;
+    }
+  }
 }
