@@ -70,7 +70,7 @@ import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 /**
- * Canaries for the Iceberg core bugs this project's fuzzers and reviews found, C1 to C33 in
+ * Canaries for the Iceberg core bugs this project's fuzzers and reviews found, C1 to C34 in
  * docs/ICEBERG_ISSUES.md: one test each, on Iceberg's own InMemoryCatalog, that asserts the bug is
  * absent. Upstream fixed C1, and the fork's core-fixes branch fixes the others, so every test
  * passes against the fork. A test that fails means its bug is back: a rebase dropped the fork's
@@ -1103,6 +1103,32 @@ class TestIcebergCoreIssues {
         .as(BACK, "C33")
         .containsEntry("k", "mine")
         .containsEntry("n", "new");
+  }
+
+  /**
+   * C34. A JDBC namespace create that loses to a concurrent create of the namespace must report
+   * that it exists: the create checked that the namespace was absent, then inserted its properties,
+   * and the insert of a loser that checked before the winner inserted failed on the primary key, an
+   * UncheckedSQLException (apache/iceberg#18759).
+   */
+  @Test
+  void aJdbcNamespaceCreateLosingARaceReportsItExists() throws IOException {
+    java.nio.file.Path db = java.nio.file.Files.createTempFile("c34", ".db");
+    java.util.concurrent.atomic.AtomicReference<Runnable> beforeWrite =
+        new java.util.concurrent.atomic.AtomicReference<>();
+    org.apache.iceberg.jdbc.JdbcCatalog racing = jdbcCatalog(db, beforeWrite);
+    org.apache.iceberg.jdbc.JdbcCatalog other =
+        jdbcCatalog(db, new java.util.concurrent.atomic.AtomicReference<>());
+    Namespace namespace = Namespace.of("created");
+
+    beforeWrite.set(() -> other.createNamespace(namespace, Map.of("owner", "winner")));
+    assertThatThrownBy(() -> racing.createNamespace(namespace, Map.of("owner", "loser")))
+        .as(BACK, "C34")
+        .isInstanceOf(AlreadyExistsException.class);
+    assertThat(beforeWrite.get()).as("the other writer raced the create").isNull();
+    assertThat(other.loadNamespaceMetadata(namespace))
+        .as(BACK, "C34")
+        .containsEntry("owner", "winner");
   }
 
   /**

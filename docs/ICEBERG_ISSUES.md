@@ -5,7 +5,7 @@ on, a review of Iceberg's commit retry paths that the fuzzers' finds
 prompted. None is in `FileIOCatalog`: each one reproduces on Iceberg's
 own `InMemoryCatalog`, directly or, for C21 and C22, by applying a
 client's updates through `CatalogHandlers` as a REST server does, or,
-for C28 and C33, on its `JdbcCatalog` over SQLite. C23
+for C28, C33 and C34, on its `JdbcCatalog` over SQLite. C23
 was accepted behavior (A1) until the review, on 2026-10-20, showed which
 part of it upstream itself calls a bug.
 This page records them for a rebase onto a newer Iceberg. Each issue also
@@ -14,12 +14,12 @@ reports or pull requests upstream. It covers the reproduction, the cause
 with links to the 1.12.0 source, the fix, its tests, and what to settle
 before a PR.
 
-Upstream fixed C1. The fork fixes C2 to C33 on branch `core-fixes`, each
+Upstream fixed C1. The fork fixes C2 to C34 on branch `core-fixes`, each
 in an upstream-style commit with its tests, so the project's tests no
 longer work around any of them.
 
-`TestIcebergCoreIssues` has a canary for each issue up to C33: a test on
-`InMemoryCatalog` (on `JdbcCatalog` over SQLite for C28 and C33) that
+`TestIcebergCoreIssues` has a canary for each issue up to C34: a test on
+`InMemoryCatalog` (on `JdbcCatalog` over SQLite for C28, C33 and C34) that
 asserts the bug is absent, with the message
 "Iceberg issue C*n* is back". Every canary passes against the fork. A
 canary that fails means a rebase dropped the fork's fix, or a release
@@ -82,7 +82,10 @@ on 2026-11-18. C33, which catalog-bench's E7 campaign found on 2026-11-19
 (JDBC namespace property updates failing under concurrency), reproduces
 on 1.12.0 and on main at `e70a2efcd0`; upstream has no report of it,
 though #4220's review noted in 2022 that the method isn't atomic, and the
-fork fixed it the same day. The Fork column is `atomicio`, which sits on
+fork fixed it the same day. C34, the same race in `createNamespace`, found
+while recording C33, is reported upstream (#18759) with an approved,
+unmerged fix (#18760), which the fork took the same day and narrowed. The
+Fork column is `atomicio`, which sits on
 `core-perf`, on `core-fixes`.
 
 | Issue | Fork | 1.12.0 | main | Upstream |
@@ -120,6 +123,7 @@ fork fixed it the same day. The Fork column is `atomicio`, which sits on
 | C31. An expiry cleans up the files of snapshots another writer removed | fixed, `core-fixes` 67a523a | yes | yes | not reported (2026-11-18); [#13568](https://github.com/apache/iceberg/issues/13568), fixed by [#13614](https://github.com/apache/iceberg/pull/13614), the nearest: incremental cleanup's choice, not its base |
 | C32. A partitions-table row depends on the order its manifests are read | fixed, `core-fixes` c82e05c | yes | yes | not reported (2026-11-18); #4516's review asked whether such a row would show "a random one" |
 | C33. A JDBC namespace property set fails when another writer sets or removes one of its keys | fixed, `core-fixes` d4cc466 | yes | yes | not reported (2026-11-19); [#4220](https://github.com/apache/iceberg/pull/4220)'s review noted it isn't atomic, and rdblue answered that generic SQL has no upsert |
+| C34. A JDBC namespace create that loses to a concurrent create fails with UncheckedSQLException | fixed, `core-fixes` 584bcfd | yes | yes | [#18759](https://github.com/apache/iceberg/issues/18759), open; PR [#18760](https://github.com/apache/iceberg/pull/18760), open and approved, which the fork takes and narrows to an INSERT that failed on the key |
 
 "Not reported" means a search of apache/iceberg's issues, pull requests
 and PR branches, and of the issues@ and dev@ lists, found nothing for the
@@ -1046,6 +1050,31 @@ committed.
 - **Canary:** `aJdbcPropertySetRacingAnotherWriterLandsWhole`: two
   `JdbcCatalog`s on one SQLite database, the second inserting, then
   removing, a key just before the first's write.
+
+### C34. A JDBC namespace create that loses to a concurrent create fails with UncheckedSQLException
+
+Details: [iceberg-issues/C34.md](iceberg-issues/C34.md).
+
+`JdbcCatalog.createNamespace` checks that the namespace is absent, then
+INSERTs its properties. Of two creates that both pass the check, the
+second INSERT fails on the primary key, an `UncheckedSQLException` (a 500
+from a REST server), where a create that finds the namespace gets
+`AlreadyExistsException`.
+
+- **Cause:** a check, then an INSERT, with no handling of the key's
+  violation.
+- **Found by:** reading `createNamespace` while recording C33
+  (2026-11-19). Upstream already had it: #18759.
+- **Fork:** fixed, `core-fixes` 584bcfd, which takes #18760: a failed
+  INSERT checks again whether the namespace exists, and throws
+  `AlreadyExistsException` if it does. The fork does so only for an
+  INSERT that failed on the key, so that a create whose connection was
+  lost after its INSERT committed isn't reported as losing to another.
+- **In fileio-catalog:** nothing to work around. FileIOCatalog's create
+  retries on a fresh read, which finds the namespace.
+- **Canary:** `aJdbcNamespaceCreateLosingARaceReportsItExists`: two
+  `JdbcCatalog`s on one SQLite database, the second creating the
+  namespace between the first's check and its INSERT.
 
 ## Accepted Iceberg Behavior
 
