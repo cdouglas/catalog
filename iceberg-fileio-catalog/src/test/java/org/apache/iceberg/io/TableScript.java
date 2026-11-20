@@ -397,7 +397,7 @@ final class TableScript {
           other.loadTable(ID).snapshots().forEach(s -> still.add(s.snapshotId()));
           run(member, handle, still);
         } catch (RuntimeException e) {
-          if (!rejects(e)) {
+          if (!rejectsHere(e)) {
             throw unexpected(e);
           }
           trace.append("  skipped: ").append(e).append('\n');
@@ -447,7 +447,7 @@ final class TableScript {
               } catch (RuntimeException e) {
                 // A transaction's table also refuses snapshot management and scans (Iceberg's
                 // BaseTransaction.TransactionTable): the member does not apply there
-                if (!rejects(e) && !(e instanceof UnsupportedOperationException)
+                if (!rejectsHere(e) && !(e instanceof UnsupportedOperationException)
                     && !(memberSkipped[0] && e instanceof IllegalStateException)) {
                   throw unexpected(e);
                 }
@@ -476,7 +476,7 @@ final class TableScript {
             catalogTxn.commitTransaction();
           }
         } catch (RuntimeException e) {
-          if (!rejects(e) && !(memberSkipped[0] && e instanceof IllegalStateException)) {
+          if (!rejectsHere(e) && !(memberSkipped[0] && e instanceof IllegalStateException)) {
             throw unexpected(e);
           }
           trace.append("  skipped: ").append(e).append('\n');
@@ -491,7 +491,7 @@ final class TableScript {
             run(first, table);
           }
         } catch (RuntimeException e) {
-          if (!rejects(e)) {
+          if (!rejectsHere(e)) {
             throw unexpected(e);
           }
           trace.append("  skipped: ").append(e).append('\n');
@@ -506,6 +506,61 @@ final class TableScript {
      * commit (a window run just before another writer's record is appended), and the commit loop
      * maps a {@code RuntimeException} it cannot classify to an outcome of that commit.
      */
+    /** {@link TableScript#rejects}, or a read of metadata the table as it is no longer has. */
+    private boolean rejectsHere(RuntimeException e) {
+      return rejects(e) || staleRead(e);
+    }
+
+    /**
+     * Whether {@code e} is a read of a manifest list or manifest that no snapshot of the tables as
+     * they are reaches: a handle that holds a snapshot an expiry since removed, and whose files it
+     * cleaned up (half of them do, since gap plan 2.7), fails so, as Iceberg's readers do once an
+     * expiry deletes what they read; a refresh would read on. A handle not refreshed after a
+     * catalog transaction committed through others is one (round p21-r0). A file a live snapshot
+     * reaches, missing, is no such read, nor is a data file.
+     */
+    private boolean staleRead(RuntimeException e) {
+      Throwable t = e;
+      while (t != null && !(t instanceof org.apache.iceberg.exceptions.NotFoundException)) {
+        t = t.getCause();
+      }
+      if (t == null || t.getMessage() == null) {
+        return false;
+      }
+      String message = t.getMessage();
+      String missing = message.substring(message.lastIndexOf(": ") + 2).trim();
+      if (!missing.contains("/metadata/")) {
+        return false;
+      }
+      for (TableIdentifier id : List.of(ID, OTHER)) {
+        Table live;
+        try {
+          live = catalog.loadTable(id);
+        } catch (org.apache.iceberg.exceptions.NoSuchTableException gone) {
+          continue;
+        } catch (RuntimeException fail) {
+          return false;
+        }
+        for (Snapshot snapshot : live.snapshots()) {
+          if (missing.equals(snapshot.manifestListLocation())) {
+            return false;
+          }
+          try {
+            for (org.apache.iceberg.ManifestFile manifest : snapshot.allManifests(live.io())) {
+              if (missing.equals(manifest.path())) {
+                return false;
+              }
+            }
+          } catch (RuntimeException fail) {
+            return false; // a live snapshot's list is unreadable: not a stale handle's read
+          }
+        }
+      }
+      trace.append("  (a stale read: ").append(missing)
+          .append(" is in no snapshot of the tables as they are)\n");
+      return true;
+    }
+
     private AssertionError unexpected(RuntimeException e) {
       return new AssertionError("a step threw what no rejection throws: " + e + "\n" + trace, e);
     }
