@@ -1202,6 +1202,39 @@ class TestIcebergCoreIssues {
         .containsEntry(org.apache.iceberg.SnapshotSummary.TOTAL_DELETE_FILES_PROP, "2");
   }
 
+  /**
+   * C36: a transaction retried after a conflict applies its updates again at higher sequence
+   * numbers, and a later update that kept an earlier one's manifest (here a delete of another
+   * file) named it with the first attempt's sequence numbers, from ManifestFilterManager's cache:
+   * on a v2 table its files read with too low a data sequence number, and an equality delete
+   * committed between the attempts applied to them.
+   */
+  @Test
+  void aRetriedTransactionKeepsTheSequenceNumbersOfItsManifests() {
+    InMemoryCatalog catalog = catalog();
+    Table table = catalog.buildTable(ID, SCHEMA)
+        .withProperty(TableProperties.FORMAT_VERSION, "2")
+        .create();
+    table.newFastAppend().appendFile(file("f0")).commit();
+
+    org.apache.iceberg.Transaction txn = table.newTransaction();
+    txn.newFastAppend().appendFile(file("f1")).commit();
+    txn.newDelete().deleteFile(file("f0")).commit(); // keeps the append's manifest
+    Table other = catalog.loadTable(ID);
+    other.newFastAppend().appendFile(file("f2")).commit();
+    txn.commitTransaction(); // retries once, a sequence number higher
+
+    Table now = catalog.loadTable(ID);
+    org.apache.iceberg.Snapshot delete = now.currentSnapshot();
+    org.apache.iceberg.Snapshot append = now.snapshot(delete.parentId());
+    assertThat(delete.dataManifests(now.io()))
+        .as(BACK, "C36")
+        .filteredOn(manifest -> manifest.snapshotId() == append.snapshotId())
+        .singleElement()
+        .extracting(org.apache.iceberg.ManifestFile::sequenceNumber)
+        .isEqualTo(append.sequenceNumber());
+  }
+
   /** An equality delete file of one row, unpartitioned, named {@code name}. */
   private static DeleteFile equalityDeletes(String name) {
     return FileMetadata.deleteFileBuilder(PartitionSpec.unpartitioned())
