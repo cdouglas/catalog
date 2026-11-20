@@ -354,13 +354,15 @@ public class LogCatalog extends BaseMetastoreViewCatalog
     return !tableIdentifier.namespace().isEmpty();
   }
 
+  /** A namespace's tables, on one read of the catalog, which also tells whether it exists. */
   @Override
   public List<TableIdentifier> listTables(Namespace namespace) {
-    if (!namespaceExists(namespace) && !namespace.isEmpty()) {
+    CatalogState state = state();
+    if (!namespace.isEmpty() && !state.containsNamespace(namespace)) {
       throw new NoSuchNamespaceException(
           "Cannot list tables for namespace. Namespace does not exist: %s", namespace);
     }
-    return state().tables().stream()
+    return state.tables().stream()
         .filter(t -> t.namespace().equals(namespace))
         .sorted(Comparator.comparing(TableIdentifier::toString))
         .collect(Collectors.toList());

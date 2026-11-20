@@ -20,6 +20,7 @@ package org.apache.iceberg.io;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.iceberg.DataFile;
@@ -43,7 +44,7 @@ import org.junit.jupiter.params.provider.EnumSource;
  * How often a commit through Iceberg's API reads the catalog object (errata D20): once, for the
  * refresh {@code SnapshotProducer.apply} makes. The read through its own write takes the object
  * from the write, and the table's operations take the catalog the commit landed in, in which
- * {@code SnapshotProducer} finds its snapshot.
+ * {@code SnapshotProducer} finds its snapshot. A read through the catalog's API reads it once too.
  */
 class TestCommitReads {
 
@@ -117,6 +118,44 @@ class TestCommitReads {
     assertThat(mode.<FileIOCatalog>catalog(io, WAREHOUSE, "c", Map.of()).loadTable(TABLE)
             .currentSnapshot().snapshotId())
         .isEqualTo(table[0].currentSnapshot().snapshotId());
+  }
+
+  /**
+   * Every read through the Catalog, ViewCatalog and SupportsNamespaces APIs reads the catalog
+   * object once: a listing of a namespace's tables checked that the namespace exists on a read of
+   * its own before it read the tables (two GETs, catalog-bench's E7). A pointer table's or view's
+   * load also reads its metadata file, which is not the catalog's.
+   */
+  @ParameterizedTest
+  @EnumSource(value = LocalCatalogMode.class, names = {"APPEND", "APPEND_TM", "APPEND_ML", "CAS",
+      "CAS_TM", "CAS_ML"})
+  void aReadThroughTheCatalogApiReadsTheCatalogOnce(LocalCatalogMode mode) {
+    InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
+    FileIOCatalog catalog = mode.catalog(io, WAREHOUSE, "c", Map.of());
+    String object = WAREHOUSE + "/catalog-c";
+    Namespace db = Namespace.of("db");
+    TableIdentifier view = TableIdentifier.of("db", "v");
+    catalog.createNamespace(db);
+    catalog.createTable(TABLE, SCHEMA);
+    catalog.buildView(view)
+        .withSchema(SCHEMA)
+        .withDefaultNamespace(db)
+        .withQuery("spark", "SELECT 1")
+        .create();
+
+    Map<String, Runnable> reads = new LinkedHashMap<>();
+    reads.put("listNamespaces", () -> catalog.listNamespaces(Namespace.empty()));
+    reads.put("namespaceExists", () -> catalog.namespaceExists(db));
+    reads.put("loadNamespaceMetadata", () -> catalog.loadNamespaceMetadata(db));
+    reads.put("listTables", () -> assertThat(catalog.listTables(db)).containsExactly(TABLE));
+    reads.put("tableExists", () -> catalog.tableExists(TABLE));
+    reads.put("loadTable", () -> catalog.loadTable(TABLE));
+    reads.put("listViews", () -> assertThat(catalog.listViews(db)).containsExactly(view));
+    reads.put("viewExists", () -> catalog.viewExists(view));
+    reads.put("loadView", () -> catalog.loadView(view));
+    reads.forEach((name, read) ->
+        assertThat(catalogRequests(io, object, read)).as("%s reads the catalog once", name)
+            .isEqualTo(1));
   }
 
   /** GETs of metadata files while {@code action} runs. */
