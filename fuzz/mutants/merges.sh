@@ -27,7 +27,11 @@
 # parent a window sealed says its parent's summary is gone. The rebase oracle's paged twin (gap plan
 # 2.9: in half the tries, an unpaged subject beside a paged twin) found the bug at tries 7 to 27 of
 # four properties; it may reject a record the subject admits only for a reason that says sealed.
-MUTANTS="minseqshift blindunguarded listfilestamp sealedlast"
+# writertime stamps a merged record's snapshot with its writer's time, not the landing table's
+# where that is later (Landing.timestamp; SPEC_TM.md "Late-bound fields"): the snapshot log goes
+# back by the window's length, which only TableViews.logical's order item sees (C5, gap plan 2.7;
+# locally caught at tries 3 to 12 of 300 by five rebase properties).
+MUTANTS="minseqshift blindunguarded listfilestamp sealedlast writertime"
 EQUIVALENT="blindnodrop"
 ORACLES=TestRebaseProperties,TestBlindAppendEncoding,TestPartitionVectorEncoding,TestManifestWindowEncoding
 
@@ -66,6 +70,10 @@ mutant() { # name main-dir test-dir
       if (needed != null) {
         return needed;
       }" ;;
+    # a merged record keeps its writer's time where the landing table's is later (C5)
+    writertime) mutate $M/Landing.java "  long timestamp(long writer) {
+    return stale ? Math.max(writer, table.lastUpdatedMillis()) : writer;" "  long timestamp(long writer) {
+    return writer;" ;;
     # blind-append's read of dropped manifests alone (equivalent, above)
     blindnodrop) mutate $M/BlindAppendEncoding.java "    if (!change.drops.isEmpty()) {
       witness.ref(change.advanced.iterator().next(), ConcernStamps.Ref.DROP);

@@ -257,20 +257,7 @@ final class TableViews {
         .map(SortOrderParser::toJson).collect(java.util.stream.Collectors.toList()));
     items.put("properties", new TreeMap<>(metadata.properties()).toString());
     items.put("metadata log length", String.valueOf(metadata.previousFiles().size()));
-    items.put("statistics", metadata.statisticsFiles().stream()
-        .map(f -> String.format("#%s %s %d/%d %s", position.get(f.snapshotId()), f.path(),
-            f.fileSizeInBytes(), f.fileFooterSizeInBytes(), f.blobMetadata().stream()
-                .map(b -> String.format("%s #%s seq=%d %s %s", b.type(),
-                    position.get(b.sourceSnapshotId()), b.sourceSnapshotSequenceNumber(),
-                    b.fields(), b.properties()))
-                .collect(java.util.stream.Collectors.toList())))
-        .sorted()
-        .collect(java.util.stream.Collectors.toList()).toString());
-    items.put("partition statistics", metadata.partitionStatisticsFiles().stream()
-        .map(f -> String.format("#%s %s %d", position.get(f.snapshotId()), f.path(),
-            f.fileSizeInBytes()))
-        .sorted()
-        .collect(java.util.stream.Collectors.toList()).toString());
+    statistics(metadata, position, items);
     for (int i = 0; i < snapshots.size(); i++) {
       Snapshot s = snapshots.get(i);
       Map<String, String> summary = new TreeMap<>(s.summary());
@@ -315,12 +302,36 @@ final class TableViews {
   }
 
   /**
+   * The table's statistics and partition statistics files, each by the position of its snapshot
+   * (and its blobs' source snapshots), as items of {@code items}.
+   */
+  private static void statistics(
+      TableMetadata metadata, Map<Long, Integer> position, Map<String, String> items) {
+    items.put("statistics", metadata.statisticsFiles().stream()
+        .map(f -> String.format("#%s %s %d/%d %s", position.get(f.snapshotId()), f.path(),
+            f.fileSizeInBytes(), f.fileFooterSizeInBytes(), f.blobMetadata().stream()
+                .map(b -> String.format("%s #%s seq=%d %s %s", b.type(),
+                    position.get(b.sourceSnapshotId()), b.sourceSnapshotSequenceNumber(),
+                    b.fields(), b.properties()))
+                .collect(java.util.stream.Collectors.toList())))
+        .sorted()
+        .collect(java.util.stream.Collectors.toList()).toString());
+    items.put("partition statistics", metadata.partitionStatisticsFiles().stream()
+        .map(f -> String.format("#%s %s %d", position.get(f.snapshotId()), f.path(),
+            f.fileSizeInBytes()))
+        .sorted()
+        .collect(java.util.stream.Collectors.toList()).toString());
+  }
+
+  /**
    * What {@code table} holds, by item, whatever its manifests' layout: its metadata, every snapshot
    * (sequence number, parent, operation, schema, summary without manifest counts) with the files it
    * added and removed, every ref with its live data files and their deletes (with partitions,
    * sequence numbers and record counts), the snapshot log, its row ids, and whether each manifest
    * says what its entries hold (its minimum sequence number, its row id range: {@link
-   * #manifests}), which no layout changes.
+   * #manifests}), which no layout changes. Also its statistics files, whether its times run
+   * forward ({@link #order}), the live files of each snapshot no ref names, and the files a
+   * snapshot reaches that are gone.
    *
    * <p>A commit's row ids depend on its layout: a manifest it writes takes ids for every row it
    * holds, kept ones too (a merged manifest's), so a retry that merges otherwise gives its new rows
@@ -375,7 +386,84 @@ final class TableViews {
     items.put("snapshot log", metadata.snapshotLog().stream()
         .map(e -> "#" + position.get(e.snapshotId()))
         .collect(java.util.stream.Collectors.toList()).toString());
+    statistics(metadata, position, items);
+    items.put(ORDER, order(metadata, position));
+    // What a snapshot no ref names would make live (a cherry-pick of a staged one, a rollback to
+    // one in a branch's history): its live data files and their deletes
+    java.util.Set<Long> heads = new java.util.HashSet<>();
+    metadata.refs().values().forEach(ref -> heads.add(ref.snapshotId()));
+    for (int i = 0; i < snapshots.size(); i++) {
+      long id = snapshots.get(i).snapshotId();
+      if (!heads.contains(id)) {
+        items.put(String.format("snapshot %02d live", i),
+            liveFiles(table.newScan().useSnapshot(id)));
+      }
+    }
+    items.put("files gone", filesGone(table, snapshots));
     return items;
+  }
+
+  /** The key of {@link #logical}'s item on whether the table's times run forward. */
+  static final String ORDER = "order";
+
+  /**
+   * Whether the table's times run forward ("forward"), or where they go back: its snapshot log,
+   * each snapshot against its parent, and its last update against the log's end. Iceberg stamps
+   * them with the wall clock, and a record merged where it lands takes the landing table's times
+   * where its writer's are older (SPEC_TM.md, "Late-bound fields"). A run during which the clock
+   * stepped back may have them out of order however they were stamped ({@link ClockSteps}), so a
+   * comparison across such a run drops the item.
+   */
+  static String order(TableMetadata metadata, Map<Long, Integer> position) {
+    List<String> back = new ArrayList<>();
+    long last = Long.MIN_VALUE;
+    for (org.apache.iceberg.HistoryEntry entry : metadata.snapshotLog()) {
+      if (entry.timestampMillis() < last) {
+        back.add("log at #" + position.get(entry.snapshotId()));
+      }
+      last = Math.max(last, entry.timestampMillis());
+    }
+    for (Snapshot s : metadata.snapshots()) {
+      Snapshot parent = s.parentId() == null ? null : metadata.snapshot(s.parentId());
+      if (parent != null && s.timestampMillis() < parent.timestampMillis()) {
+        back.add("#" + position.get(s.snapshotId()) + " before its parent");
+      }
+    }
+    if (metadata.lastUpdatedMillis() < last) {
+      back.add("last update before the log's end");
+    }
+    return back.isEmpty() ? "forward" : "back: " + back;
+  }
+
+  /**
+   * The data and delete files some snapshot of {@code table} reaches that its storage no longer
+   * holds, by path: "none" unless a cleanup or a purge deleted what a snapshot still reaches.
+   */
+  private static String filesGone(Table table, List<Snapshot> snapshots) {
+    java.util.Set<String> gone = new java.util.TreeSet<>();
+    java.util.Set<String> read = new java.util.HashSet<>();
+    Map<Integer, org.apache.iceberg.PartitionSpec> specs = table.specs();
+    for (Snapshot snapshot : snapshots) {
+      for (ManifestFile manifest : snapshot.allManifests(table.io())) {
+        if (!read.add(manifest.path())) {
+          continue;
+        }
+        try (org.apache.iceberg.io.CloseableIterable<? extends org.apache.iceberg.ContentFile<?>>
+            files = manifest.content() == org.apache.iceberg.ManifestContent.DATA
+                ? org.apache.iceberg.ManifestFiles.read(manifest, table.io(), specs)
+                : org.apache.iceberg.ManifestFiles.readDeleteManifest(
+                    manifest, table.io(), specs)) {
+          for (org.apache.iceberg.ContentFile<?> file : files) {
+            if (!table.io().newInputFile(file.location()).exists()) {
+              gone.add(file.location());
+            }
+          }
+        } catch (IOException e) {
+          throw new UncheckedIOException(e);
+        }
+      }
+    }
+    return gone.isEmpty() ? "none" : gone.toString();
   }
 
   /**
@@ -399,9 +487,13 @@ final class TableViews {
 
   /** The live data files of {@code ref}, each with its delete files, sorted, without row ids. */
   private static String liveFiles(Table table, String ref) {
+    return liveFiles(table.newScan().useRef(ref));
+  }
+
+  /** The live data files {@code scan} plans, each with its deletes, sorted, without row ids. */
+  private static String liveFiles(org.apache.iceberg.TableScan scan) {
     List<String> out = new ArrayList<>();
-    try (org.apache.iceberg.io.CloseableIterable<FileScanTask> tasks =
-        table.newScan().useRef(ref).planFiles()) {
+    try (org.apache.iceberg.io.CloseableIterable<FileScanTask> tasks = scan.planFiles()) {
       for (FileScanTask task : tasks) {
         List<String> deletes = new ArrayList<>();
         for (DeleteFile d : task.deletes()) {

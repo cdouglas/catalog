@@ -687,6 +687,8 @@ class TestRebaseProperties {
       List<TableScript.Cmd> window,
       TableScript.Cmd r,
       int[] twin) {
+    ClockSteps clock = new ClockSteps();
+    CLOCK.set(clock);
     StringBuilder trace = new StringBuilder(String.format(
         "v%d %s, %s, %s%s%s%s%nprefix %s%nwindow %s%s%nR %s%n", formatVersion,
         partitioned ? "partitioned" : "unpartitioned", mode, encoding,
@@ -777,12 +779,39 @@ class TestRebaseProperties {
           run.failure == null ? "committed" : "failed (" + run.failure + ")", name,
           reference.failure == null ? "committed" : "failed (" + reference.failure + ")", trace));
     }
-    List<String> differences = TableViews.differences(reference.view, run.view, "reference", name);
+    List<String> differences = TableViews.differences(
+        withoutClockOrder(reference.view), withoutClockOrder(run.view), "reference", name);
     if (!differences.isEmpty()) {
       throw new AssertionError("the " + name + "'s table differs from the reference's:\n  "
           + String.join("\n  ", differences.subList(0, Math.min(4, differences.size())))
           + "\n" + trace);
     }
+  }
+
+  /**
+   * The wall clock's watch during this thread's try ({@link #verify}): Iceberg stamps snapshots and
+   * metadata with it, so whether a table's times run forward ({@link TableViews#order}) is
+   * compared only where it did not step back. Runs look at it after each of their steps.
+   */
+  private static final ThreadLocal<ClockSteps> CLOCK = new ThreadLocal<>();
+
+  /** Looks at this thread's clock watch, if any: a step since the last look marks it. */
+  private static void lookAtClock() {
+    ClockSteps clock = CLOCK.get();
+    if (clock != null) {
+      clock.stepped();
+    }
+  }
+
+  /** {@code view} without its order item if the clock stepped during this thread's try. */
+  private static Map<String, String> withoutClockOrder(Map<String, String> view) {
+    ClockSteps clock = CLOCK.get();
+    if (clock == null || !clock.stepped()) {
+      return view;
+    }
+    Map<String, String> without = new java.util.TreeMap<>(view);
+    without.remove(TableViews.ORDER);
+    return without;
   }
 
   /**
@@ -1488,6 +1517,7 @@ class TestRebaseProperties {
           trace).severalFiles(merging);
       for (List<TableScript.Cmd> step : TableScript.steps(prefix)) {
         writer.run(step);
+        lookAtClock();
       }
       List<List<TableScript.Cmd>> steps = TableScript.steps(window);
       List<TableScript.Runner> racers = racers(io, mode, writers, steps.size(), merging, trace);
@@ -1505,6 +1535,7 @@ class TestRebaseProperties {
           before[0] = version(io);
           for (int i = 0; i < steps.size(); i++) {
             results.add(racers.get(i).run(steps.get(i)) == null ? "ok" : "rejected");
+            lookAtClock();
           }
           after[0] = version(io);
           beforeR[0] = current(io);
@@ -1517,6 +1548,7 @@ class TestRebaseProperties {
       try {
         trace.append("R:\n");
         failure = writer.run(List.of(r));
+        lookAtClock();
       } finally {
         io.injectFaults((location, strategy) -> Fault.NONE);
       }
@@ -1636,12 +1668,14 @@ class TestRebaseProperties {
           new StringBuilder()).severalFiles(merging);
       for (List<TableScript.Cmd> step : TableScript.steps(prefix)) {
         writer.run(step);
+        lookAtClock();
       }
       List<List<TableScript.Cmd>> steps = TableScript.steps(window);
       List<TableScript.Runner> racers =
           racers(io, mode, writers, steps.size(), merging, new StringBuilder());
       for (int i = 0; i < steps.size(); i++) {
         racers.get(i).run(steps.get(i));
+        lookAtClock();
       }
       TableMetadata beforeR = current(io);
       org.apache.iceberg.TableOperations ops =

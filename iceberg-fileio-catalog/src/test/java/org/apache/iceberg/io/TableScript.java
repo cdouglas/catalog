@@ -518,7 +518,7 @@ final class TableScript {
           target.newRowDelta().addDeletes(
                   org.apache.iceberg.FileMetadata.deleteFileBuilder(target.spec())
                       .ofEqualityDeletes(1)
-                      .withPath(names + "eq" + nextFile++ + ".parquet")
+                      .withPath(written(target, names + "eq" + nextFile++ + ".parquet"))
                       .withFileSizeInBytes(10)
                       .withRecordCount(1)
                       .withPartitionPath(partitionPath(target.spec(), cmd.c))
@@ -540,7 +540,7 @@ final class TableScript {
           rewrite
               .deleteFile(compacted)
               .addFile(DataFiles.builder(target.specs().get(compacted.specId()))
-                  .withPath(names + "r" + nextFile++ + ".parquet")
+                  .withPath(written(target, names + "r" + nextFile++ + ".parquet"))
                   .withFileSizeInBytes(10)
                   .withRecordCount(compacted.recordCount())
                   .withPartition(compacted.partition())
@@ -812,11 +812,13 @@ final class TableScript {
         case EXPIRE_SNAPSHOTS:
           // Every snapshot is old enough: the wall clock is not consulted, since after a step back
           // "now" would precede the snapshots stamped just before the step (ClockSteps), and two
-          // runs of one schedule would expire different snapshots.
+          // runs of one schedule would expire different snapshots. Half of them clean up the files
+          // the expired snapshots alone reach, which must spare every file a snapshot still does
+          // (TableViews.logical's "files gone"; a merged expiry cleans up on its base).
           target.expireSnapshots()
               .expireOlderThan(Long.MAX_VALUE)
               .retainLast(cmd.b % 3 + 1)
-              .cleanExpiredFiles(false)
+              .cleanExpiredFiles(cmd.c / 2 % 2 == 1)
               .cleanExpiredMetadata(cmd.c % 2 == 0)
               .commit();
           break;
@@ -982,6 +984,21 @@ final class TableScript {
      * The files a data command {@code cmd} adds: one in partition {@code cmd.c % 4} ({@link
      * #newFile}), or {@code cmd.a % 3 + 1} there with {@link #severalFiles}.
      */
+    /**
+     * Writes the one-byte object a data or delete file names, as an engine writes a file before it
+     * commits it, so a cleanup that deletes a file a snapshot still reaches shows ({@link
+     * TableViews#logical}'s "files gone").
+     */
+    private static String written(Table target, String path) {
+      try (org.apache.iceberg.io.PositionOutputStream out =
+          target.io().newOutputFile(path).createOrOverwrite()) {
+        out.write(1);
+      } catch (java.io.IOException e) {
+        throw new java.io.UncheckedIOException(e);
+      }
+      return path;
+    }
+
     private List<DataFile> newFiles(Table target, Cmd cmd) {
       List<DataFile> files = new ArrayList<>();
       for (int i = severalFiles ? cmd.a % 3 + 1 : 1; i > 0; i--) {
@@ -998,7 +1015,7 @@ final class TableScript {
     DataFile newFile(Table target, int index) {
       int k = Math.floorMod(index, 4);
       return DataFiles.builder(target.spec())
-          .withPath(names + "f" + nextFile++ + ".parquet")
+          .withPath(written(target, names + "f" + nextFile++ + ".parquet"))
           .withFileSizeInBytes(10)
           .withRecordCount(1)
           .withPartitionPath(partitionPath(target.spec(), k))
@@ -1060,12 +1077,12 @@ final class TableScript {
               .withPartition(data.partition());
       if (((HasTableOperations) target).operations().current().formatVersion() >= 3) {
         delete.withFormat(org.apache.iceberg.FileFormat.PUFFIN)
-            .withPath(names + "dv" + nextFile++ + ".puffin")
+            .withPath(written(target, names + "dv" + nextFile++ + ".puffin"))
             .withReferencedDataFile(data.location())
             .withContentOffset(4)
             .withContentSizeInBytes(6);
       } else {
-        delete.withPath(names + "pos" + nextFile++ + ".parquet");
+        delete.withPath(written(target, names + "pos" + nextFile++ + ".parquet"));
       }
       return delete.build();
     }
