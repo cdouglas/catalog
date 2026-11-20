@@ -2713,6 +2713,7 @@ class TestCatalogFaultProperties {
         case ROLLBACK:
           boolean toAncestor = cmd.c % 2 == 0;
           long[] mainTarget = {-1};
+          boolean[] noOp = {false};
           return new Op(
               (toAncestor ? "rollbackTo(" : "setCurrentSnapshot(") + id + ", pick " + cmd.b + ")",
               () -> {
@@ -2732,7 +2733,11 @@ class TestCatalogFaultProperties {
                 Statistics.label("a ref moved behind the sealing line")
                     .collect(sealed(id, snapshotId));
                 try {
+                  // SnapshotManager refreshes the table: its operation is on main as it is now,
+                  // which a stale handle's pick may already name
                   ManageSnapshots manage = table.manageSnapshots();
+                  noOp[0] = table.currentSnapshot() != null
+                      && table.currentSnapshot().snapshotId() == snapshotId;
                   (toAncestor ? manage.rollbackTo(snapshotId)
                       : manage.setCurrentSnapshot(snapshotId)).commit();
                 } catch (IllegalArgumentException e) {
@@ -2741,6 +2746,12 @@ class TestCatalogFaultProperties {
               },
               (m, actual) -> {
                 TableState state = existing(m, id);
+                if (noOp[0]) {
+                  // main named the snapshot already where the operation refreshed the table:
+                  // Iceberg commits nothing, and the operation takes effect there, before any
+                  // command that preempted it and moved main since (round p25-r0)
+                  return;
+                }
                 TableState now = actual.get(id);
                 if (now == null || !Objects.equals(now.refIds.get(SnapshotRef.MAIN_BRANCH),
                     mainTarget[0])) {
