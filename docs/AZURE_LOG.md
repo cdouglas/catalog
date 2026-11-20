@@ -223,6 +223,13 @@ which is the bug `SegmentedLog.tla`'s `sdkretry` switch puts back.
   none, share the log its creator made; a catalog object on Azure keeps its segments at the
   default and records nothing; a client without credentials for the recorded account fails,
   naming it.
+- **One store contract** (`AppendBlobStoreContract`): what the log relies on of an Append Blob
+  store (creates once, appends where they land and with their block index, the size, position and
+  block-size conditions refused with nothing landed, reads from any offset, block blobs by ETag,
+  listings without directories), run on `InMemoryAppendBlobStore` (`TestInMemoryAppendBlobStore`,
+  also the block-count limit, lowered), on Azurite (`TestAzureAppendBlobStore`, with
+  `AZURITE_BLOB_ENDPOINT`) and on a real account (`AzureAppendBlobStoreIT`, an account key), so
+  the store every fuzzer runs on answers as the service does.
 - **A real account:** `AzureAppendBlobStoreIT` (the store's requests), and `AzureLogCatalogIT`
   (the catalog suites with their segments on the account, its catalog objects in memory, so each
   records its prefix; run explicitly with `AZURE_LOG_IT_CONTAINER_URL` and `AZURE_STORAGE_KEY` or

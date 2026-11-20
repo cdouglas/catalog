@@ -219,8 +219,11 @@ public final class InMemoryAppendBlobStore implements AppendBlobStore {
   public synchronized long appendBlock(String name, byte[] block, long maxSize, long appendPosition) {
     Fault fault = before(Op.APPEND, name);
     Stored s = blobs.get(name);
-    if (s == null || !s.append) {
+    if (s == null) {
       throw new NotFound("No Append Blob " + name);
+    }
+    if (!s.append) { // the service's 409 InvalidBlobType: the blob is there, of another kind
+      throw new Refused("InvalidBlobType: " + name + " is not an Append Blob", null);
     }
     if (block.length > maxBlockBytes()) {
       throw new Refused("RequestBodyTooLarge: a block of " + block.length + " bytes is larger than "
@@ -382,11 +385,24 @@ public final class InMemoryAppendBlobStore implements AppendBlobStore {
     before(Op.LIST, null);
     List<Entry> entries = new ArrayList<>();
     blobs.forEach((name, s) -> {
-      if (name.startsWith(prefix)) {
+      if (name.startsWith(prefix) && !folder(s.metadata)) {
         entries.add(new Entry(name, s.modified));
       }
     });
     return entries;
+  }
+
+  /**
+   * A directory's placeholder, which a listing of a hierarchical namespace holds and the store
+   * leaves out, as {@link AzureAppendBlobStore} does.
+   */
+  private static boolean folder(Map<String, String> metadata) {
+    for (Map.Entry<String, String> e : metadata.entrySet()) {
+      if ("hdi_isfolder".equalsIgnoreCase(e.getKey()) && "true".equalsIgnoreCase(e.getValue())) {
+        return true;
+      }
+    }
+    return false;
   }
 
   @Override

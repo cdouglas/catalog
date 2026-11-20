@@ -21,6 +21,7 @@ package org.intentlog.azure;
 import com.azure.core.http.policy.HttpPipelinePolicy;
 import com.azure.storage.blob.BlobContainerClient;
 import com.azure.storage.blob.BlobContainerClientBuilder;
+import com.azure.storage.blob.BlobServiceVersion;
 import com.azure.storage.blob.BlobUrlParts;
 import com.azure.storage.blob.models.BlobItem;
 import com.azure.storage.blob.models.BlobListDetails;
@@ -74,6 +75,12 @@ final class CloudAccount {
       builder.addPolicy(policy);
     }
     return builder.buildClient();
+  }
+
+  /** A client of the account's container pinned to service version {@code version}. */
+  static BlobContainerClient container(BlobServiceVersion version) {
+    return new BlobContainerClientBuilder().endpoint(URL).credential(credential())
+        .serviceVersion(version).buildClient();
   }
 
   /** The store on the account: one try per request. */
