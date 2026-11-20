@@ -10,9 +10,9 @@ For invariants that must not regress, see [design.md](design.md). For the
 wire format see [SPEC.md](SPEC.md), [ATOMIC_FILE_LOG.md](ATOMIC_FILE_LOG.md)
 and [LOG.md](LOG.md). Bugs in Apache Iceberg itself are in
 [ICEBERG_ISSUES.md](ICEBERG_ISSUES.md): upstream fixed C1 (1.11.0) and the
-fork's `core-fixes` branch fixes C2-C30, so this project's tests work around
+fork's `core-fixes` branch fixes C2-C36, so this project's tests work around
 none of them. `TestIcebergCoreIssues` asserts each is absent; on stock Iceberg
-1.12.0 C2-C30 come back.
+1.12.0 C2-C36 come back.
 
 An entry's ID is not reused: a finished entry is deleted and its ID retired.
 Retired: S3-S5, D1-D3, D5-D7, D9, D10, D11, D15, D17, D19, D20, D23, D24, D26, D29, T1, T2,
@@ -660,3 +660,64 @@ measured at E1's and E3's points on `s3x-2026-11`. Still to take:
   Iceberg's retry, whose longer backoff throttled the writers).
 
 **Trigger:** before the paper's cloud runs.
+
+### U7. A stale handle on a pointer table fails where an inline one commits (stale handle reads expired list)
+
+Round p26-r0 (fileio ec3c267, fork p20, 2026-11-20), shard `diff.6`:
+`TestInlineDifferentialProperties.inlineCatalogReadsLikeAPointerCatalog`, seed
+-3033262475300780792 at 273 tries, failing at the last (v3 unpartitioned,
+`APPEND_TM`). The schedule expires snapshots, tags, appends, and then a handle
+loaded before the expiry rewrites files. In the pointer catalog the rewrite is
+rejected (`NotFoundException` for an expired snapshot's manifest list, which
+the expiry deleted): a stale read. In the inline catalog it commits, because the
+stale handle holds its lists in memory. The oracle lets a stale-read rejection
+match any rejection in the other arm (fileio ec3c267), but not a commit there.
+
+To settle: does the inline commit land what Iceberg would commit on a refresh,
+so that the oracle should also accept a stale read in one arm beside a commit
+in the other, or does it land a rewrite on files the expiry removed, so that the
+inline catalog should refuse it? The failure's excerpt is in
+`~/work/.replays/p26-r0/diff.6.failure.txt`, and the whole log is on havoc at
+`~/data/ce-fuzz-p16g/out/p26-r0/diff.6.log.gz`.
+
+**Trigger:** the triage of the week of 2026-11-23. Replay the seed first.
+
+### U8. A paged table rejects an unraced catalog transaction (paged txn rejected unraced)
+
+Round p26-r0, shard `rebase.3`:
+`TestRebaseProperties.aMergedExpiryRemovesWhatItChoseOnItsBase`, seed
+-7954634700587828010 at 198 tries (`lamport-minus-properties`, v3 partitioned,
+`COMPACT_ML`, the twin paged at block 2 and window 1). The paged twin diverged in
+the prefix, not in R. The prefix's catalog transaction (SNAPSHOT: `ROLLBACK`,
+`SET_PROPERTY`, `STAGED_APPEND`, `FAST_APPEND`) committed in the unpaged subject
+and in the reference. With nothing racing it, the twin rejected it:
+`CommitFailedException` "unresolved: the parent whose summary entries its
+snapshot takes is gone". The twin's table then ends at last-seq 6, the
+reference's at 8.
+
+A guess, unverified: the transaction rolls main back onto a snapshot the twin
+has sealed. Its append's parent is then in a page, which replay never reads. If
+so, an unraced transaction should commit, bringing the snapshot back as a ref
+moved onto a sealed snapshot does, and a rejection should at least say
+`sealed` (Bug 129 (sealed rejections misattributed)). The twin's admission
+check covers R only, so this surfaced as the end-state difference. Excerpt:
+`~/work/.replays/p26-r0/rebase.3.failure.txt`.
+
+**Trigger:** the triage of the week of 2026-11-23. Replay the seed first.
+
+### U9. A record may name one manifest path twice with different entries (record restates pooled path)
+
+This was found while chasing C36 (retry keeps stale manifest seqs), round p26-r0
+`rebase.4`. The subject merged a retried transaction's record whose two
+snapshots named one manifest path with different sequence numbers.
+`ProtoCodec.restatesPooledManifest` checks a record's manifests only against
+the pool before the record, so the second mention passes.
+`CatalogState.Builder.addManifestToPool` then throws `ReplayCheckError` under
+the pool check (surefire, the fuzzers). Without the check, it overwrites the
+pool's entry, so the first snapshot's list reads the manifest at the second's
+numbers. With C36 fixed, no writer we know of sends such a record. Replay should
+still refuse it deterministically (`pool: restates a pooled manifest`), and the
+writer should evict the table as it does for a restated manifest. Write the
+regression test first.
+
+**Trigger:** the triage of the week of 2026-11-23.
