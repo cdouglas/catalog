@@ -467,10 +467,11 @@ class TestCatalogRaceProperties {
         || raceA.equals("CommitStateUnknownException"));
     // The serial runs the race may end as, the first that matches: D after A, or before it if D
     // ran while A's operation did; without A if it failed as it may, or, if it lost its outcome
-    // to gc, with it too; and a catalog transaction that committed before the racers that ran
-    // before its writes, which it may serialize ahead of, since what it found absent was no read
-    // (a drop of a table not yet created returns false; docs/CATALOG_TRANSACTIONS.md). A mismatch
-    // is reported against the first.
+    // to gc, with it too; and a catalog transaction that committed (or lost its outcome to gc:
+    // where it took effect, it took effect as one that committed; round p23-r0) before the racers
+    // that ran before its writes, which it may serialize ahead of, since what it found absent was
+    // no read (a drop of a table not yet created returns false; docs/CATALOG_TRANSACTIONS.md). A
+    // mismatch is reported against the first.
     boolean excluded = replaced || lost;
     String race = outcomes(raceA, results, d, resultD[0], raceAgain);
     List<Op> aOrNone = new java.util.ArrayList<>();
@@ -483,7 +484,8 @@ class TestCatalogRaceProperties {
     boolean tookEffect = false; // A lost its outcome, but the race ends as the serial run with A
     boolean dBeforeA = false;
     boolean aFirstSerially = false;
-    boolean mayGoFirst = a.kind == Kind.CATALOG_TXN && before > 0 && raceA.startsWith("ok");
+    boolean mayGoFirst =
+        a.kind == Kind.CATALOG_TXN && before > 0 && (raceA.startsWith("ok") || lost);
     candidates:
     for (Op serialOp : aOrNone) {
       for (boolean dFirst : dDuring[0] ? new boolean[] {false, true} : new boolean[] {false}) {
