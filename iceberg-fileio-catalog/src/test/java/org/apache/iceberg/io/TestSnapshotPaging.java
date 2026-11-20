@@ -41,6 +41,8 @@ import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.relocated.com.google.common.collect.Iterables;
 import org.apache.iceberg.types.Types;
+import org.intentlog.Replica;
+import org.intentlog.memory.InMemorySharedLog;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
@@ -272,6 +274,110 @@ class TestSnapshotPaging {
     }
     try (CloseableIterable<FileScanTask> tasks = fresh.newScan().useRef("b").planFiles()) {
       assertThat(Iterables.size(tasks)).isEqualTo(45); // main's 42 when branched, and its three
+    }
+  }
+
+  /**
+   * A load that asks for no history reads no page (SNAPSHOT_PAGING.md, "Loads"), counted at the
+   * store: reads of the catalog object's {@code .committed/} prefix, or a shared log's page gets.
+   * A fresh catalog loads a table whose root names sealed blocks; its schema, properties, refs,
+   * current snapshot and snapshot log, scans of main, of a branch and of a tag made on snapshots
+   * that were sealed (a ref moved onto one brings it back inline), a refresh, and merge and fast
+   * appends through it read none. A load that asks for the history reads the pages, each once: a
+   * scan of a sealed snapshot by id, then every snapshot.
+   */
+  @ParameterizedTest
+  @EnumSource(names = {"CAS_TM", "COMPACT_ML", "COMPACT_TM", "MEMLOG_ML", "AZLOG_ML"})
+  void aLoadThatAsksForNoHistoryReadsNoPage(LocalCatalogMode mode) throws Exception {
+    LogCatalog writer = mode.catalog(io, WAREHOUSE, "reads", paging(4, 8));
+    writer.createNamespace(Namespace.of("ns"));
+    Table table = writer.buildTable(TABLE, SCHEMA).withPartitionSpec(SPEC).create();
+    List<Long> ids = new ArrayList<>();
+    for (int i = 0; i < 40; i++) {
+      append(table, i);
+      ids.add(table.currentSnapshot().snapshotId());
+    }
+    CatalogState sealing = writer.log().read().state();
+    int tblId = sealing.tableId(TABLE);
+    assertThat(sealing.sealedBlockOf(tblId, ids.get(5))).isNotNull();
+    assertThat(sealing.sealedBlockOf(tblId, ids.get(9))).isNotNull();
+    table.manageSnapshots().createBranch("b", ids.get(5)).createTag("t", ids.get(9)).commit();
+    for (int i = 40; i < 44; i++) {
+      append(table, i);
+    }
+    if (mode.sharedLog) {
+      writer.log().compact();
+    }
+    // The newest root names sealed blocks: what a fresh load finds there is in pages
+    Replica<CatalogState> read = writer.log().read();
+    assertThat(read.state().sealedBlocks(tblId)).isNotEmpty();
+    int sealed = read.state().sealedBlocks(tblId).size();
+
+    List<String> pageReads = new ArrayList<>();
+    countPageReads(mode, "reads", pageReads);
+    Table loaded = mode.catalog(io, WAREHOUSE, "reads", paging(4, 8)).loadTable(TABLE);
+    assertThat(loaded.schema().columns()).hasSize(2);
+    assertThat(loaded.properties()).isNotNull();
+    assertThat(loaded.refs()).containsKeys("main", "b", "t");
+    assertThat(loaded.currentSnapshot().snapshotId()).isEqualTo(
+        table.currentSnapshot().snapshotId());
+    assertThat(loaded.history()).hasSize(44);
+    try (CloseableIterable<FileScanTask> tasks = loaded.newScan().planFiles()) {
+      assertThat(Iterables.size(tasks)).isEqualTo(44);
+    }
+    try (CloseableIterable<FileScanTask> tasks = loaded.newScan().useRef("b").planFiles()) {
+      assertThat(Iterables.size(tasks)).isEqualTo(6);
+    }
+    try (CloseableIterable<FileScanTask> tasks = loaded.newScan().useRef("t").planFiles()) {
+      assertThat(Iterables.size(tasks)).isEqualTo(10);
+    }
+    loaded.refresh();
+    loaded.newAppend().appendFile(file(100)).commit();
+    loaded.newFastAppend().appendFile(file(101)).commit();
+    assertThat(pageReads).as("reads of pages by a load that asks for no history").isEmpty();
+
+    Table history = mode.catalog(io, WAREHOUSE, "reads", paging(4, 8)).loadTable(TABLE);
+    try (CloseableIterable<FileScanTask> tasks =
+        history.newScan().useSnapshot(ids.get(2)).planFiles()) {
+      assertThat(Iterables.size(tasks)).isEqualTo(3);
+    }
+    assertThat(history.snapshots()).hasSize(46);
+    assertThat(pageReads).as("reads of pages by a load that asks for the history").isNotEmpty();
+    assertThat(new java.util.HashSet<>(pageReads))
+        .as("pages read, each once (a page's lookup and its GET are one read)")
+        .hasSizeLessThanOrEqualTo(sealed);
+    assertThat(pageReads).hasSizeLessThanOrEqualTo(2 * sealed);
+  }
+
+  /**
+   * Adds to {@code reads} the name of each page the catalog {@code name} reads from now on: on
+   * the catalog object's store, each read request (a lookup or a GET) under its {@code .committed/}
+   * prefix; on a shared log, each page get.
+   */
+  private void countPageReads(LocalCatalogMode mode, String name, List<String> reads) {
+    String location = WAREHOUSE + "/catalog-" + name;
+    if (mode.sharedLog) {
+      LocalCatalogMode.sharedLog(io, location).intercept(new InMemorySharedLog.Interceptor() {
+        @Override
+        public InMemorySharedLog.PageFault beforePage(
+            InMemorySharedLog.Request request, String page) {
+          if (request == InMemorySharedLog.Request.GET_PAGE) {
+            synchronized (reads) {
+              reads.add(page);
+            }
+          }
+          return InMemorySharedLog.PageFault.NONE;
+        }
+      });
+    } else {
+      io.injectReadFaults(at -> {
+        if (at.startsWith(location + ".committed/")) {
+          synchronized (reads) {
+            reads.add(at);
+          }
+        }
+        return InMemoryAtomicFileIO.ReadFault.NONE;
+      });
     }
   }
 

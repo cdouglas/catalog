@@ -658,6 +658,11 @@ handles), on one object and on a shared log:
   from the pages a compaction stored or, before one, from those its replay
   sealed;
 - a commit makes no snapshot it does not add;
+- a load that asks for no history reads no page, counted at the store (the
+  catalog object's `.committed/` reads, or a shared log's page gets): its
+  schema, refs, current snapshot and snapshot log, scans of main, of a branch
+  and of a tag on snapshots that were sealed, a refresh, and merge and fast
+  appends through it; one that asks for the history reads each page once;
 - a rollback or a tag onto a sealed snapshot brings it back with its proof,
   and a proof for another place, or a forged leaf, proves nothing;
 - an expiry that empties blocks drops their pages, which the compaction that
