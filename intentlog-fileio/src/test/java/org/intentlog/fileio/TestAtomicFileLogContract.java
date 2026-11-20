@@ -40,6 +40,31 @@ class TestAtomicFileLogContract {
     protected long pageWrites() {
       return io.writesLanded(); // only page puts write while a page case runs
     }
+
+    /**
+     * Full: the object holds as many writes as it has (the store's cap, as S3 Express's parts).
+     * Refused: the store's client error ({@code StorageRefusedException}).
+     */
+    @Override
+    protected boolean refuseNextWrite(Refusal refusal) {
+      switch (refusal) {
+        case FULL:
+          io.limitSegments(io.segments("mem:///log"));
+          return true;
+        case REFUSED:
+          boolean[] once = {true};
+          io.injectFaults((location, strategy) -> {
+            if (once[0]) {
+              once[0] = false;
+              return InMemoryAtomicFileIO.Fault.REFUSED;
+            }
+            return InMemoryAtomicFileIO.Fault.NONE;
+          });
+          return true;
+        default:
+          return false;
+      }
+    }
   }
 
   @Nested

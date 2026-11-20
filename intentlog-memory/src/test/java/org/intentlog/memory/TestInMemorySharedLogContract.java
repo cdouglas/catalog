@@ -31,6 +31,11 @@ class TestInMemorySharedLogContract {
     protected SharedLog newLog() {
       return new InMemorySharedLog("log");
     }
+
+    @Override
+    protected boolean refuseNextWrite(Refusal refusal) {
+      return notSentNext((InMemorySharedLog) log, refusal);
+    }
   }
 
   @Nested
@@ -44,5 +49,30 @@ class TestInMemorySharedLogContract {
     protected boolean appendsUnconditionally() {
       return false;
     }
+
+    @Override
+    protected boolean refuseNextWrite(Refusal refusal) {
+      return notSentNext((InMemorySharedLog) log, refusal);
+    }
+  }
+
+  /** The log's next append is not sent; it has no way to be full or refused. */
+  private static boolean notSentNext(InMemorySharedLog log, SharedLogContract.Refusal refusal) {
+    if (refusal != SharedLogContract.Refusal.NOT_SENT) {
+      return false;
+    }
+    boolean[] once = {true};
+    log.intercept(new InMemorySharedLog.Interceptor() {
+      @Override
+      public InMemorySharedLog.WriteFault beforeWrite(
+          InMemorySharedLog.Request request, byte[] payload) {
+        if (request == InMemorySharedLog.Request.APPEND && once[0]) {
+          once[0] = false;
+          return InMemorySharedLog.WriteFault.NOT_SENT;
+        }
+        return InMemorySharedLog.WriteFault.NONE;
+      }
+    });
+    return true;
   }
 }

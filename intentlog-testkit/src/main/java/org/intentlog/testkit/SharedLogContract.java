@@ -29,6 +29,9 @@ import java.util.List;
 import java.util.UUID;
 import org.intentlog.Capabilities;
 import org.intentlog.LogConflictException;
+import org.intentlog.LogFullException;
+import org.intentlog.LogNotSentException;
+import org.intentlog.LogRefusedException;
 import org.intentlog.LogTail;
 import org.intentlog.LogView;
 import org.intentlog.PageStore;
@@ -203,6 +206,45 @@ public abstract class SharedLogContract {
     if (before >= 0) {
       assertThat(pageWrites() - before).as("page writes").isEqualTo(names);
     }
+  }
+
+  /** How a provider can make the log's next write fail, before it lands anything (P6). */
+  public enum Refusal {
+    /** The store takes no more writes to the log's object: {@link LogFullException}. */
+    FULL,
+    /** The write was not sent: {@link LogNotSentException}. */
+    NOT_SENT,
+    /** The store refused it, as it would again: {@link LogRefusedException}. */
+    REFUSED
+  }
+
+  /**
+   * Makes the log's next append fail as {@code refusal}, before it lands anything; false if the
+   * provider has no way to (the case is skipped).
+   */
+  protected boolean refuseNextWrite(Refusal refusal) {
+    return false;
+  }
+
+  /**
+   * P6: an append the log reports full, not sent or refused landed nothing: a read finds the
+   * records before it, and no other.
+   */
+  @ParameterizedTest
+  @EnumSource(Refusal.class)
+  void anAppendFullNotSentOrRefusedLandedNothing(Refusal refusal) { // P6
+    assumeAppends();
+    create(checkpoint(0));
+    byte[] first = record();
+    append(first);
+    assumeThat(refuseNextWrite(refusal)).as("the provider can refuse a write as " + refusal)
+        .isTrue();
+    byte[] refused = record();
+    Class<? extends RuntimeException> expected =
+        refusal == Refusal.FULL ? LogFullException.class
+            : refusal == Refusal.REFUSED ? LogRefusedException.class : LogNotSentException.class;
+    assertThatThrownBy(() -> append(refused)).isInstanceOf(expected);
+    assertThat(log.read().records()).containsExactly(first);
   }
 
   @Test
