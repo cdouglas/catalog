@@ -14,11 +14,11 @@ reports or pull requests upstream. It covers the reproduction, the cause
 with links to the 1.12.0 source, the fix, its tests, and what to settle
 before a PR.
 
-Upstream fixed C1. The fork fixes C2 to C34 on branch `core-fixes`, each
+Upstream fixed C1. The fork fixes C2 to C35 on branch `core-fixes`, each
 in an upstream-style commit with its tests, so the project's tests no
 longer work around any of them.
 
-`TestIcebergCoreIssues` has a canary for each issue up to C34: a test on
+`TestIcebergCoreIssues` has a canary for each issue up to C35: a test on
 `InMemoryCatalog` (on `JdbcCatalog` over SQLite for C28, C33 and C34) that
 asserts the bug is absent, with the message
 "Iceberg issue C*n* is back". Every canary passes against the fork. A
@@ -84,7 +84,12 @@ on 1.12.0 and on main at `e70a2efcd0`; upstream has no report of it,
 though #4220's review noted in 2022 that the method isn't atomic, and the
 fork fixed it the same day. C34, the same race in `createNamespace`, found
 while recording C33, is reported upstream (#18759) with an approved,
-unmerged fix (#18760), which the fork took the same day and narrowed. The
+unmerged fix (#18760), which the fork took the same day and narrowed. C35
+(a transaction's retry counting its delete files twice in the summary),
+which fileio-catalog's rebase oracle found on 2026-11-20 with a table
+transaction as R, reproduces on 1.12.0 and on main at `e70a2efcd0`; its fix
+is in open PR #17986, which met the same double count by another path, and
+the fork took it the same day. The
 Fork column is `atomicio`, which sits on
 `core-perf`, on `core-fixes`.
 
@@ -124,6 +129,7 @@ Fork column is `atomicio`, which sits on
 | C32. A partitions-table row depends on the order its manifests are read | fixed, `core-fixes` c82e05c | yes | yes | not reported (2026-11-18); #4516's review asked whether such a row would show "a random one" |
 | C33. A JDBC namespace property set fails when another writer sets or removes one of its keys | fixed, `core-fixes` d4cc466 | yes | yes | not reported (2026-11-19); [#4220](https://github.com/apache/iceberg/pull/4220)'s review noted it isn't atomic, and rdblue answered that generic SQL has no upsert |
 | C34. A JDBC namespace create that loses to a concurrent create fails with UncheckedSQLException | fixed, `core-fixes` 584bcfd | yes | yes | [#18759](https://github.com/apache/iceberg/issues/18759), open; PR [#18760](https://github.com/apache/iceberg/pull/18760), open and approved, which the fork takes and narrows to an INSERT that failed on the key |
+| C35. A transaction retried after a conflict counts its delete files twice in the snapshot summary | fixed, `core-fixes` 25bebf2 | yes | yes | not reported as such (2026-11-20); the fix is in PR [#17986](https://github.com/apache/iceberg/pull/17986), open, which met it after a failed manifest write |
 
 "Not reported" means a search of apache/iceberg's issues, pull requests
 and PR branches, and of the issues@ and dev@ lists, found nothing for the

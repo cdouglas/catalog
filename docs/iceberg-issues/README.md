@@ -37,7 +37,9 @@ written on 1.12.0 (`core-fixes`); the method it changes is unchanged on
 C28; its main change applies on `main` at `e70a2efcd0` on its own, and its
 test file needs a one-line merge of imports without C28. C34, added the
 same day, takes open PR #18760; its main change applies on `main` on its
-own, and its tests use C28's and C33's test helpers.
+own, and its tests use C28's and C33's test helpers. C35, added
+2026-11-20, takes open PR #17986's `MergingSnapshotProducer` change; it
+applies on `main` at `e70a2efcd0` on its own.
 
 | Issue | Fix | Before a PR |
 |---|---|---|
@@ -75,3 +77,4 @@ own, and its tests use C28's and C33's test helpers.
 | [C32. A partitions-table row depends on the order its manifests are read](C32.md) | [`c82e05c`](https://github.com/cdouglas/iceberg/commit/c82e05cd72a0f7b822cd43fdd5542620b2ff995e) | ready: a PR with the test; settle which spec a tie reports (the greatest id here); cite #4516's review |
 | [C33. A JDBC namespace property set fails when another writer sets or removes one of its keys](C33.md) | [`d4cc466`](https://github.com/cdouglas/iceberg/commit/d4cc46604d) | ready: a PR with the tests, citing #4220's review; settle the retry bound |
 | [C34. A JDBC namespace create that loses to a concurrent create fails with UncheckedSQLException](C34.md) | [`584bcfd`](https://github.com/cdouglas/iceberg/commit/584bcfd97b) | don't file: #18759 reports it and PR #18760 fixes it (approved); offer the narrowing to a key violation, with the lost-reply test |
+| [C35. A transaction retried after a conflict counts its delete files twice in the snapshot summary](C35.md) | [`25bebf2`](https://github.com/cdouglas/iceberg/commit/25bebf2c0b) | don't file alone: offer the transaction's path as a test on PR #17986, which carries the fix |

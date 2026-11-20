@@ -1175,6 +1175,44 @@ class TestIcebergCoreIssues {
   }
 
   /**
+   * C35. A transaction retried after a conflict must count each delete file it adds once in its
+   * snapshot's summary: MergingSnapshotProducer counted them as it wrote its delete manifests, and
+   * a commit into the transaction, on a table that merges manifests, cleaned up the new one it
+   * merged, so the retry wrote it again and counted every delete file twice.
+   */
+  @Test
+  void aRetriedTransactionCountsItsDeleteFilesOnce() {
+    InMemoryCatalog catalog = catalog();
+    Table table = catalog.buildTable(ID, SCHEMA)
+        .withProperty(TableProperties.FORMAT_VERSION, "2")
+        .withProperty(TableProperties.MANIFEST_MIN_MERGE_COUNT, "2")
+        .create();
+    table.newFastAppend().appendFile(file("f0")).commit();
+    table.newRowDelta().addDeletes(equalityDeletes("eq0")).commit();
+
+    org.apache.iceberg.Transaction txn = table.newTransaction();
+    txn.newRowDelta().addDeletes(equalityDeletes("eq1")).commit();
+    Table other = catalog.loadTable(ID);
+    other.manageSnapshots().createBranch("b", other.currentSnapshot().snapshotId()).commit();
+    txn.commitTransaction(); // retries once
+
+    assertThat(catalog.loadTable(ID).currentSnapshot().summary())
+        .as(BACK, "C35")
+        .containsEntry(org.apache.iceberg.SnapshotSummary.ADDED_DELETE_FILES_PROP, "1")
+        .containsEntry(org.apache.iceberg.SnapshotSummary.TOTAL_DELETE_FILES_PROP, "2");
+  }
+
+  /** An equality delete file of one row, unpartitioned, named {@code name}. */
+  private static DeleteFile equalityDeletes(String name) {
+    return FileMetadata.deleteFileBuilder(PartitionSpec.unpartitioned())
+        .ofEqualityDeletes(1)
+        .withPath(path(name))
+        .withFileSizeInBytes(10)
+        .withRecordCount(1)
+        .build();
+  }
+
+  /**
    * A JdbcCatalog on the SQLite database {@code db} whose connections run what {@code beforeWrite}
    * holds before preparing each statement that writes namespace properties.
    */
