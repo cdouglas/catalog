@@ -3162,7 +3162,16 @@ class TestCatalogFaultProperties {
           return new Op(
               "reinline(" + id + ")",
               () -> w.catalog.reinline(id),
-              (m, actual) -> existing(m, id));
+              (m, actual) -> {
+                // A re-inlining of a table already inline reads it and writes nothing: one a
+                // preempting command removed after that read is acknowledged as of the read, the
+                // table then in neither the model nor the catalog (p21-cal-pagefaults); one that
+                // brought it back would leave it in the catalog
+                if (!preempting.isEmpty() && !m.containsKey(id) && !actual.containsKey(id)) {
+                  return;
+                }
+                existing(m, id);
+              });
         case SWEEP:
           int from = cmd.b % 3;
           Replica<CatalogState> replica = from == 0 ? null
