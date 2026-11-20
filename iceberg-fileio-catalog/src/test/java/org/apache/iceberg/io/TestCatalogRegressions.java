@@ -9126,4 +9126,36 @@ public class TestCatalogRegressions {
       return ids;
     }
   }
+
+  /**
+   * Bug 131 (sealed window misreported as ancestry): manifest-window judges a record on a changed
+   * table by the snapshots its branch took since the record's parent, walking back from the head;
+   * a branch the record creates lands on main's head, so the walk starts there. On a paged table
+   * the walk met snapshots sealed since, and said "its parent is not an ancestor of its branch's
+   * head", where the record needed sealed snapshots it could not read: replay's check of what a
+   * record needs sealed walks from the branch's own head, which a new branch has none of. The
+   * rebase oracle's paged twin found it in round p20-r0 (gap plan 2.9), as Bug 129's kind: the
+   * twin rejected an append to a new branch that its unpaged subject merged, for a reason that is
+   * not sealed. The walk now says it reached a sealed snapshot ({@code sealed: window reaches}).
+   */
+  @Nested
+  class ASealedWindowSaysSealed {
+    @Test
+    void anAppendCreatingABranchBehindAWindowOfSealedSnapshots() {
+      // round p20-r0, rebase.2
+      TestRebaseProperties.verify(ManifestWindowEncoding.NAME, 3, true, LocalCatalogMode.CAS_ML,
+          true, false, List.of(),
+          List.of(cmd(TableScript.Kind.STATISTICS, 6, 9, 10),
+              cmd(TableScript.Kind.OVERWRITE_PARTITION, 2, 5, 4),
+              cmd(TableScript.Kind.INSERT_ROW_DELTA, 4, 0, 4),
+              cmd(TableScript.Kind.EXPIRE_SNAPSHOTS, 4, 11, 1),
+              cmd(TableScript.Kind.CHECKPOINT_APPEND, 6, 3, 10),
+              cmd(TableScript.Kind.ADD_COLUMN, 4, 3, 10),
+              cmd(TableScript.Kind.CREATE_BRANCH, 11, 10, 2),
+              cmd(TableScript.Kind.UPDATE_COLUMN, 3, 1, 8)),
+          List.of(cmd(TableScript.Kind.INSERT_ROW_DELTA, 3, 0, 8),
+              cmd(TableScript.Kind.POSITION_DELETE, 6, 6, 2)),
+          cmd(TableScript.Kind.BRANCH_APPEND, 6, 11, 1), new int[] {1, 0});
+    }
+  }
 }

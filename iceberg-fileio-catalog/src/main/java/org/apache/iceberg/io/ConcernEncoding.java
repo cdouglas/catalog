@@ -283,7 +283,8 @@ abstract class ConcernEncoding implements ConflictEncoding<ConcernEncoding.Witne
     if (witness.window != null) {
       String why = witness.window.rejects(landing);
       if (why != null) {
-        return "window: " + why;
+        // a window that reaches a sealed snapshot says so as replay's own check would
+        return why.startsWith("sealed:") ? why : "window: " + why;
       }
     }
     return null;

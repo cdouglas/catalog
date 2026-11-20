@@ -136,7 +136,11 @@ final class ManifestWindowEncoding extends ConcernVectorEncoding {
       while (!Objects.equals(at, parent)) {
         Snapshot snapshot = at != null ? table.snapshot(at) : null;
         if (snapshot == null) {
-          return "its parent is not an ancestor of its branch's head";
+          // A snapshot the table keeps sealed is in the window, which replay cannot read: the
+          // record needs it (Bug 131 (sealed window misreported as ancestry))
+          return at != null && landing.sealed(at)
+              ? "sealed: window reaches " + at
+              : "its parent is not an ancestor of its branch's head";
         } else if (window.size() >= MAX_WINDOW) {
           return "longer than " + MAX_WINDOW + " snapshots";
         }

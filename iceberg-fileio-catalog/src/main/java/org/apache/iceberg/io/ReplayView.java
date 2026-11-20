@@ -94,6 +94,11 @@ final class ReplayView {
     return inline != null ? inline.fields() : null;
   }
 
+  /** Whether the table keeps snapshot {@code snapshotId} sealed, in a block's page. */
+  boolean sealed(long snapshotId) {
+    return builder.sealedBlockOf(tableId, snapshotId) != null;
+  }
+
   /** Whether the table has an inline manifest list for {@code snapshotId}. */
   boolean hasInlineList(long snapshotId) {
     return builder.hasSnapshotManifests(tableId, snapshotId);

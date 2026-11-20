@@ -264,7 +264,11 @@ anywhere later. The sealed reason comes before the conflict encoding's, which
 judged a table that lacked the snapshot (a merge whose parent's summary is
 gone, a window whose parent "is not an ancestor"): conflict counts would
 otherwise take a record paging rejected for a conflict (Bug 129 (sealed
-rejections misattributed)).
+rejections misattributed)). Replay's own check walks back from the branch's
+head, which a branch the record creates does not have yet; manifest-window
+walks from where the branch lands (main's head, for a new branch), and its
+walk says `sealed: window reaches <id>` when it meets a sealed snapshot
+(Bug 131 (sealed window misreported as ancestry)).
 
 ## Expiry
 
@@ -746,7 +750,7 @@ four tables). With paging set:
   reference does. R lands behind a window, which often seals what R built
   on. The twin may reject R's record where the subject admits it only with a
   reason that says `sealed`; its other rejections must be the subject's, and
-  it must admit nothing the subject rejects. It found Bug 129.
+  it must admit nothing the subject rejects. It found Bugs 129 and 131.
 
 A round's faultA2 and faultB2 run at B = 2, W = 1, which reaches sealed
 blocks and import pages (step 5); the fault fuzzer reports the most sealed
