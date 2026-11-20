@@ -1031,9 +1031,11 @@ committed.
 
 - **Cause:** a read, then two statements in auto-commit mode, with no
   handling of a key inserted or removed since the read.
-- **Found by:** catalog-bench's E7 campaign (2026-11-19): 16 of about
-  250,000 namespace property updates on JDBC failed with the INSERT's
+- **Found by:** catalog-bench's E7 campaign (2026-11-19): 16 namespace
+  property updates on JDBC failed with the INSERT's
   `UncheckedSQLException`, 14 of them at 10 times the workload's rate.
+  All came in the runs' first 14 seconds, as writers first inserted the
+  namespaces' keys; after that every set was an UPDATE.
 - **Fork:** fixed, `core-fixes` d4cc466: both statements run in one
   transaction. When either finds the keys changed, the transaction rolls
   back and the set tries again on a fresh read, up to five attempts,
