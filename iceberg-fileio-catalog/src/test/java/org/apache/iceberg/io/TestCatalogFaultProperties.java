@@ -4091,6 +4091,14 @@ class TestCatalogFaultProperties {
      * Checks the catalog against the model, given what {@code op} reported; {@code must}, if not
      * null, says why {@code op} must not have been rejected if its model effect applies.
      */
+    /**
+     * Why a model effect did not apply: its exception's message, or the exception itself when it
+     * has none. Never null: a null here would read as an effect that applied.
+     */
+    private static String notApplied(RuntimeException e) {
+      return e.getMessage() != null ? e.getMessage() : e.toString();
+    }
+
     private void resolve(Cmd cmd, Op op, Outcome outcome, String reason, String must,
         boolean preempted, boolean faultless) {
       Model actual = actual();
@@ -4102,9 +4110,9 @@ class TestCatalogFaultProperties {
         if (outcome == Outcome.ACKNOWLEDGED) {
           throw fail("acknowledged %s, but %s", op, e.getMessage());
         }
-        applies = e.getMessage();
+        applies = notApplied(e);
       } catch (IllegalStateException e) {
-        applies = e.getMessage();
+        applies = notApplied(e);
       }
       String withDiff = applies != null ? applies : diff(with, actual);
       String withoutDiff = diff(model, actual);
