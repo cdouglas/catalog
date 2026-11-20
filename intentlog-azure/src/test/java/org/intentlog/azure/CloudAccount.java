@@ -18,6 +18,7 @@
  */
 package org.intentlog.azure;
 
+import com.azure.core.credential.AzureSasCredential;
 import com.azure.core.http.policy.HttpPipelinePolicy;
 import com.azure.storage.blob.BlobContainerClient;
 import com.azure.storage.blob.BlobContainerClientBuilder;
@@ -40,14 +41,16 @@ import java.util.concurrent.ThreadLocalRandom;
 
 /**
  * The account the cloud tests run on: {@code AZURE_LOG_IT_CONTAINER_URL} (a container's URL on
- * the primary endpoint) and {@code AZURE_STORAGE_KEY}, its account key. Unset, the tests do
- * nothing. Each run writes under its own prefix, {@code intentlog-it/<UTC>-<random>}, and deletes
- * it afterwards.
+ * the primary endpoint) and {@code AZURE_STORAGE_KEY}, its account key, or {@code
+ * AZURE_STORAGE_SAS}, a SAS of it that can list (as {@code AzureLogCatalogIT} takes them; the key
+ * when both are set). Unset, the tests do nothing. Each run writes under its own prefix, {@code
+ * intentlog-it/<UTC>-<random>}, and deletes it afterwards.
  */
 final class CloudAccount {
 
   static final String URL = System.getenv("AZURE_LOG_IT_CONTAINER_URL");
   static final String KEY = System.getenv("AZURE_STORAGE_KEY");
+  static final String SAS = System.getenv("AZURE_STORAGE_SAS");
   static final String RUN = "intentlog-it/"
       + DateTimeFormatter.ofPattern("yyyyMMdd'T'HHmmss'Z'").withZone(ZoneOffset.UTC)
           .format(Instant.now())
@@ -58,18 +61,25 @@ final class CloudAccount {
   private CloudAccount() {}
 
   static boolean configured() {
-    return URL != null && !URL.isEmpty() && KEY != null && !KEY.isEmpty();
+    return URL != null && !URL.isEmpty() && (hasKey() || (SAS != null && !SAS.isEmpty()));
   }
 
-  private static StorageSharedKeyCredential credential() {
-    return new StorageSharedKeyCredential(BlobUrlParts.parse(URL).getAccountName(), KEY);
+  private static boolean hasKey() {
+    return KEY != null && !KEY.isEmpty();
+  }
+
+  /** {@code builder}, authenticated by the account key, or else the SAS. */
+  private static BlobContainerClientBuilder authenticated(BlobContainerClientBuilder builder) {
+    return hasKey()
+        ? builder.credential(
+            new StorageSharedKeyCredential(BlobUrlParts.parse(URL).getAccountName(), KEY))
+        : builder.credential(new AzureSasCredential(SAS));
   }
 
   /** A client of the account's container, one try per request, through {@code policies}. */
   static BlobContainerClient container(HttpPipelinePolicy... policies) {
-    BlobContainerClientBuilder builder = new BlobContainerClientBuilder().endpoint(URL)
-        .credential(credential())
-        .retryOptions(
+    BlobContainerClientBuilder builder =
+        authenticated(new BlobContainerClientBuilder().endpoint(URL)).retryOptions(
             new RequestRetryOptions(RetryPolicyType.FIXED, 1, (Duration) null, null, null, null));
     for (HttpPipelinePolicy policy : policies) {
       builder.addPolicy(policy);
@@ -79,14 +89,17 @@ final class CloudAccount {
 
   /** A client of the account's container pinned to service version {@code version}. */
   static BlobContainerClient container(BlobServiceVersion version) {
-    return new BlobContainerClientBuilder().endpoint(URL).credential(credential())
+    return authenticated(new BlobContainerClientBuilder().endpoint(URL))
         .serviceVersion(version).buildClient();
   }
 
   /** The store on the account: one try per request. */
   static synchronized AzureAppendBlobStore store() {
     if (store == null) {
-      store = AzureAppendBlobStore.create(URL, credential());
+      store = hasKey()
+          ? AzureAppendBlobStore.create(URL,
+              new StorageSharedKeyCredential(BlobUrlParts.parse(URL).getAccountName(), KEY))
+          : AzureAppendBlobStore.create(URL, new AzureSasCredential(SAS));
     }
     return store;
   }
@@ -97,8 +110,8 @@ final class CloudAccount {
    * blobs it deleted.
    */
   static int deleteAll(String prefix) {
-    BlobContainerClient c = new BlobContainerClientBuilder().endpoint(URL)
-        .credential(credential()).buildClient();
+    BlobContainerClient c = authenticated(new BlobContainerClientBuilder().endpoint(URL))
+        .buildClient();
     List<String> files = new ArrayList<>();
     List<String> folders = new ArrayList<>();
     for (BlobItem item : c.listBlobs(new ListBlobsOptions().setPrefix(prefix)
