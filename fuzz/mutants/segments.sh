@@ -13,12 +13,15 @@
 # migration writes one); creationleak, a creator that lost keeping its segment 0, under a log id
 # no sweep lists (a leak); and kbound, a writer sizing its largest record by its own K, not the
 # store's block limit (Bug 115 (segment that cannot end): the fuzzer's instances share one K).
+# shortvoid is the model's switch of that name (the 2026-11-17 review's F3): the read through an
+# append takes a walk that read short of its copy's segment, before any end, for void; caught
+# locally (2026-11-20) by the fuzzer at try 47 of 2,000: a commit rejected EXHAUSTED, applied.
 # fastvoid is equivalent (2026-11-15, 2,000 tries locally): an append whose reply puts it past the
 # limit is void with no read and never in a receipt, and a receipt whose store can't say the index
 # has none for the fast path to match. Locally at 2,000 tries (2026-11-17) the other thirteen are
 # caught: dropretired, nolocation, creationleak and kbound by TestSegmentedLog, sweepothers and
 # overlimit by both, and the rest by the fuzzer.
-MUTANTS="readahead voidack createonmissing sweepearly sweepinflight sweepothers sdkretry overlimit fastvoid lastcopy dropretired nolocation creationleak kbound"
+MUTANTS="readahead voidack createonmissing sweepearly sweepinflight sweepothers sdkretry overlimit fastvoid lastcopy dropretired nolocation creationleak kbound shortvoid"
 EQUIVALENT="fastvoid"
 ORACLES=TestSegmentedCommitProtocol,TestSegmentedLog
 
@@ -81,6 +84,11 @@ mutant() { # name main-dir test-dir (the catalog's; these mutants are intentlog'
     kbound) mutate $SL "    long frame = Math.min(store.maxBlockBytes(), blocks > 1 ? room / (blocks - 1) : room);" "    long frame = Math.min(store.maxBlockBytes(), limit > 1 ? room / (limit - 1) : room);" ;;
     # the read through an append skips its read for a copy at the kept view's end, past the limit
     fastvoid) mutate $SL "          && t.records() + 1 == cp.index && cp.index <= seg.limit()) {" "          && t.records() + 1 == cp.index) {" ;;
+    # a walk that read short of the copy's segment, before any end, taken for void (the model's
+    # shortvoid)
+    shortvoid) mutate $SL "      if (w.at == cp.ordinal) {
+        return null; // read short of the copy: read again" "      if (w.at == cp.ordinal) {
+        return VOID; // read short of the copy: read again" ;;
     # the read through an append decides by the last copy the log holds
     lastcopy) mutate $SL "    for (Copy cp : r.copies) {" "    List<Copy> order = new ArrayList<>(r.copies);
     java.util.Collections.reverse(order);

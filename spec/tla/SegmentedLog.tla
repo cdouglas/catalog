@@ -26,12 +26,13 @@
 (* SharedLogCommit's `log` is: it only grows (P1), every acknowledged      *)
 (* record is in it where its read-through found it (P3), every read is a   *)
 (* slice of it from a checkpoint, checkpoints keep their place, every      *)
-(* segment can end (SG8), and a record has no copy in it that its writer   *)
-(* doesn't know may have landed (the shared-log model's `dup`). Another    *)
-(* log keeps a segment at the same prefix, which its own catalog object    *)
-(* names: it must outlive this log's sweeps, Bug 100 (sweep deleted        *)
-(* another log's segments). Bug switches put back LOG_SEGMENTS.md's        *)
-(* mistakes.                                                               *)
+(* segment can end (SG8), a copy its writer judged void is never in it     *)
+(* (D4: a void append leaves nothing to resolve), and a record has no copy *)
+(* in it that its writer doesn't know may have landed (the shared-log      *)
+(* model's `dup`). Another log keeps a segment at the same prefix, which   *)
+(* its own catalog object names: it must outlive this log's sweeps, Bug    *)
+(* 100 (sweep deleted another log's segments). Bug switches put back       *)
+(* LOG_SEGMENTS.md's mistakes.                                             *)
 (***************************************************************************)
 EXTENDS Integers, Sequences, FiniteSets, TLC
 
@@ -61,7 +62,7 @@ ASSUME /\ Limit >= 1 /\ MaxBlocks >= 1 /\ MaxOrd >= 0 /\ MaxSends >= 1 /\ MaxCop
        /\ FaultKinds \subseteq {"lostReply", "notSent", "inflight", "shortRead"}
        /\ Bugs \subseteq {"catalogseal", "limitatnext", "sealcount", "readahead", "voidack",
                           "createonmissing", "sweepearly", "sweepinflight", "sweepothers",
-                          "sdkretry", "overlimit"}
+                          "sdkretry", "overlimit", "shortvoid"}
        \* A log refuses a limit its store can't hold; "overlimit" installs one anyway.
        /\ Limit <= MaxBlocks \/ "overlimit" \in Bugs
 
@@ -100,10 +101,11 @@ VARIABLES
   vok,       \* ghost: every read so far was a slice of Abstract when it ended
   nf,        \* faults injected so far
   comp,      \* compactors' budgets used: [ck, sw]
-  seen       \* ghost, for the witnesses
+  seen,      \* ghost, for the witnesses
+  voids      \* ghost: the copies writers judged void, [r, ord, idx]
 
 vars == <<blob, cat, chain, lims, closedAt, ckpts, pendCk, inflight, ws, rs, acks, sends, vok,
-          nf, comp, seen>>
+          nf, comp, seen, voids>>
 
 -----------------------------------------------------------------------------
 (* Segments *)
@@ -171,7 +173,8 @@ WInit == [pc |-> "start", i |-> 1, wc |-> None, n |-> 0, cps |-> << >>, ci |-> 1
 \* on; lo: the lowest ordinal it may send to; cand: its candidate segment; c: a record count
 \* it read; tgt: the segment it is sealing; kn: ordinals it has seen end.
 
-UNCH_W == UNCHANGED <<cat, chain, lims, closedAt, ckpts, pendCk, rs, vok, comp>>
+UNCH_W0 == UNCHANGED <<cat, chain, lims, closedAt, ckpts, pendCk, rs, vok, comp>>
+UNCH_W == UNCH_W0 /\ UNCHANGED voids
 
 SetW(w, s2) == ws' = [ws EXCEPT ![w] = s2]
 
@@ -243,11 +246,13 @@ SendOk(w, j) ==
      /\ nf' = IF twice THEN nf + 1 ELSE nf
      /\ sends' = [sends EXCEPT ![r] = @ + 1]
      /\ IF void
-          THEN SetW(w, [s EXCEPT !.n = @ + 1, !.lo = seg.ord + 1, !.kn = @ \cup {seg.ord}])
-          ELSE SetW(w, [s EXCEPT !.n = @ + 1, !.pc = "rt",
-                                 !.cps = Append(@, [ord |-> seg.ord, name |-> nm, idx |-> idx])])
+          THEN /\ SetW(w, [s EXCEPT !.n = @ + 1, !.lo = seg.ord + 1, !.kn = @ \cup {seg.ord}])
+               /\ voids' = voids \cup {[r |-> r, ord |-> seg.ord, idx |-> idx]}
+          ELSE /\ SetW(w, [s EXCEPT !.n = @ + 1, !.pc = "rt",
+                                    !.cps = Append(@, [ord |-> seg.ord, name |-> nm, idx |-> idx])])
+               /\ UNCHANGED voids
      /\ seen' = [seen EXCEPT !.voidreply = @ \/ void]
-     /\ UNCH_W /\ UNCHANGED <<inflight, acks>>
+     /\ UNCH_W0 /\ UNCHANGED <<inflight, acks>>
 
 CanFault(fk) == fk \in FaultKinds /\ nf < MaxFaults
 
@@ -285,7 +290,8 @@ LandInflight(a) ==
        THEN /\ blob' = Land(blob, a.name, [r |-> a.r, n |-> 0])
             /\ seen' = [seen EXCEPT !.late = TRUE]
        ELSE UNCHANGED <<blob, seen>>
-  /\ UNCHANGED <<cat, chain, lims, closedAt, ckpts, pendCk, ws, rs, acks, sends, vok, nf, comp>>
+  /\ UNCHANGED <<cat, chain, lims, closedAt, ckpts, pendCk, ws, rs, acks, sends, vok, nf, comp,
+                 voids>>
 
 -----------------------------------------------------------------------------
 (* Installing a segment: create it under a fresh name, then append its     *)
@@ -346,7 +352,8 @@ Cas(w) ==
                                     !.pc = IF ~Named(cat, o) /\ LastOrd(cat) = o - 1
                                              THEN (IF Has("limitatnext") THEN "lread" ELSE "cas")
                                              ELSE "send"])
-     /\ UNCHANGED <<blob, closedAt, ckpts, pendCk, rs, vok, comp, inflight, acks, sends, nf>>
+     /\ UNCHANGED <<blob, closedAt, ckpts, pendCk, rs, vok, comp, inflight, acks, sends, nf,
+                    voids>>
 
 -----------------------------------------------------------------------------
 (* The read-through: the receipt's copies in ordinal order. Each needs the *)
@@ -360,15 +367,22 @@ Pending(s) ==
   {j \in 1..Len(s.wc.segs) : s.wc.segs[j].ord < Cur(s).ord /\ s.wc.segs[j].ord \notin s.kn}
 
 \* Read an earlier segment: gone (retired, so ended) or ended, or seal it.
+\* A short read (a fault) returns a prefix of its frames: one that shows no
+\* end may hide one, so the writer seals the segment, which is harmless.
 RtCheck(w, j) ==
   LET s == ws[w]
       seg == s.wc.segs[j]
       b == blob[seg.name]
   IN /\ s.pc = "rt" /\ s.ci <= Len(s.cps) /\ j \in Pending(s)
-     /\ IF ~b.ex \/ Ended(b.fr, seg.lim, seg.cl)
-          THEN SetW(w, [s EXCEPT !.kn = @ \cup {seg.ord}])
-          ELSE SetW(w, [s EXCEPT !.pc = "seal", !.tgt = seg, !.c = Lead(b.fr)])
-     /\ UNCH_W /\ UNCHANGED <<blob, inflight, acks, sends, nf, seen>>
+     /\ \E e \in (IF b.ex THEN 0..Len(b.fr) ELSE {0}) :
+          LET short == b.ex /\ e < Len(b.fr)
+              fr == SubSeq(b.fr, 1, e)
+          IN /\ short => CanFault("shortRead")
+             /\ nf' = IF short THEN nf + 1 ELSE nf
+             /\ IF ~b.ex \/ Ended(fr, seg.lim, seg.cl)
+                  THEN SetW(w, [s EXCEPT !.kn = @ \cup {seg.ord}])
+                  ELSE SetW(w, [s EXCEPT !.pc = "seal", !.tgt = seg, !.c = Lead(fr)])
+     /\ UNCH_W /\ UNCHANGED <<blob, inflight, acks, sends, seen>>
 
 \* A seal frame, appended blind. It carries the count read before it, which
 \* only "sealcount" reads. With "catalogseal" the writer instead records that
@@ -391,7 +405,7 @@ SealStep(w) ==
      /\ blob' = IF ~Has("catalogseal") /\ blob[nm].ex /\ Len(blob[nm].fr) < MaxBlocks
                   THEN Land(blob, nm, [r |-> Seal, n |-> s.c]) ELSE blob
      /\ seen' = [seen EXCEPT !.seal = @ \/ ~Has("catalogseal")]
-     /\ UNCHANGED <<chain, lims, ckpts, pendCk, rs, vok, comp, inflight, acks, sends, nf>>
+     /\ UNCHANGED <<chain, lims, ckpts, pendCk, rs, vok, comp, inflight, acks, sends, nf, voids>>
 
 \* Before reading through, the writer may send a copy to a later segment.
 CopyMore(w) ==
@@ -402,34 +416,50 @@ CopyMore(w) ==
 
 \* Read the copy's segment. Gone: trimmed, the outcome unknown; the record is
 \* given up. In: acknowledged. Void (it ended before the copy): the next
-\* copy, or send again past it. "voidack" accepts the frame regardless.
+\* copy, or send again past it. "voidack" accepts the frame regardless. A
+\* short read (a fault) returns a prefix of the frames: one that reaches the
+\* copy, or shows the segment ended before it, decides as a whole read does;
+\* one that does neither says nothing, and the writer reads again (the Java
+\* tells "ended before the copy" from "read short of it"). With "shortvoid"
+\* it takes such a prefix for void.
 RtRead(w) ==
   LET s == ws[w]
       cp == Cur(s)
       seg == SegOf(s.wc, cp.ord)
       b == blob[cp.name]
-      in == Has("voidack") \/ cp.idx <= Valid(b.fr, seg.lim, seg.cl)
       r == Recs[w][s.i]
   IN /\ s.pc = "rt" /\ s.ci <= Len(s.cps) /\ Pending(s) = {}
-     /\ CASE ~b.ex ->
-               /\ SetW(w, NextRec(w, s))
-               /\ UNCHANGED <<acks, seen>>
-          [] in ->
-               /\ acks' = acks \cup {[r |-> r, ord |-> cp.ord, idx |-> cp.idx]}
-               /\ SetW(w, NextRec(w, s))
-               /\ seen' = [seen EXCEPT !.second = @ \/ s.ci > 1]
-          [] OTHER ->
-               /\ SetW(w, [s EXCEPT !.ci = @ + 1, !.kn = @ \cup {cp.ord},
-                                    !.pc = IF s.ci + 1 <= Len(s.cps) THEN "rt" ELSE "send",
-                                    !.lo = cp.ord + 1])
-               /\ seen' = [seen EXCEPT !.void = TRUE]
-               /\ UNCHANGED acks
-     /\ UNCH_W /\ UNCHANGED <<blob, inflight, sends, nf>>
+     /\ IF ~b.ex
+          THEN /\ SetW(w, NextRec(w, s))
+               /\ UNCHANGED <<acks, seen, nf, voids>>
+          ELSE \E e \in 0..Len(b.fr) :
+                 LET short == e < Len(b.fr)
+                     fr == SubSeq(b.fr, 1, e)
+                     in == Has("voidack") \/ cp.idx <= Valid(fr, seg.lim, seg.cl)
+                 IN /\ short => CanFault("shortRead")
+                    /\ nf' = IF short THEN nf + 1 ELSE nf
+                    /\ CASE in ->
+                              /\ acks' = acks \cup {[r |-> r, ord |-> cp.ord, idx |-> cp.idx]}
+                              /\ SetW(w, NextRec(w, s))
+                              /\ seen' = [seen EXCEPT !.second = @ \/ s.ci > 1]
+                              /\ UNCHANGED voids
+                         [] Ended(fr, seg.lim, seg.cl) \/ Has("shortvoid") ->
+                              /\ SetW(w, [s EXCEPT !.ci = @ + 1, !.kn = @ \cup {cp.ord},
+                                                   !.pc = IF s.ci + 1 <= Len(s.cps) THEN "rt"
+                                                          ELSE "send",
+                                                   !.lo = cp.ord + 1])
+                              /\ voids' = voids \cup {[r |-> r, ord |-> cp.ord, idx |-> cp.idx]}
+                              /\ seen' = [seen EXCEPT !.void = TRUE]
+                              /\ UNCHANGED acks
+                         [] OTHER ->
+                              /\ seen' = [seen EXCEPT !.shortrt = TRUE]
+                              /\ UNCHANGED <<ws, acks, voids>>
+     /\ UNCH_W0 /\ UNCHANGED <<blob, inflight, sends>>
 
 -----------------------------------------------------------------------------
 (* Compactors: putCheckpoint (a CAS replace) and the sweep *)
 
-UNCH_C == UNCHANGED <<chain, lims, closedAt, inflight, ws, rs, acks, sends, vok, nf>>
+UNCH_C == UNCHANGED <<chain, lims, closedAt, inflight, ws, rs, acks, sends, vok, nf, voids>>
 
 \* Put a checkpoint through a place in the log past the catalog object's.
 PutCk ==
@@ -487,7 +517,7 @@ RInit == [pc |-> "idle", rc |-> None, j |-> 0, rec |-> 0, k |-> 0, v |-> << >>, 
 \* ended segment). k: the checkpoint's place in Abstract; v: the records read.
 
 UNCH_R == UNCHANGED <<blob, cat, chain, lims, closedAt, ckpts, pendCk, inflight, ws, acks,
-                      sends, comp>>
+                      sends, comp, voids>>
 
 SetR(r, q2) == rs' = [rs EXCEPT ![r] = q2]
 Retry(r, q) == SetR(r, [q EXCEPT !.pc = "idle", !.n = @ + 1])
@@ -578,7 +608,8 @@ Init ==
   /\ comp = [ck |-> 0, sw |-> 0]
   /\ seen = [full |-> FALSE, voidreply |-> FALSE, caslost |-> FALSE, w404 |-> FALSE,
              r404 |-> FALSE, rnext |-> FALSE, late |-> FALSE, seal |-> FALSE, void |-> FALSE,
-             second |-> FALSE, retired |-> FALSE, swept |-> FALSE]
+             second |-> FALSE, retired |-> FALSE, swept |-> FALSE, shortrt |-> FALSE]
+  /\ voids = {}
 
 WriterNext(w) ==
   \/ WStart(w) \/ GiveUp(w) \/ StartInstall(w) \/ LRead(w) \/ Create(w) \/ Cas(w)
@@ -620,6 +651,12 @@ AckedInLog ==
     /\ InLog(a.ord, a.idx)
     /\ SegFr(a.ord + 1)[a.idx].r = a.r
 
+\* D4: a copy its writer judged void (by the reply's block count, or by a
+\* read that showed its segment ended before it) is never in the log: the
+\* runtime takes a void append for a lost race with nothing to resolve.
+VoidNotInLog ==
+  \A v \in voids : ~(InLog(v.ord, v.idx) /\ SegFr(v.ord + 1)[v.idx].r = v.r)
+
 \* Every segment the catalog object names exists (SG4, SG6).
 NamedExist == \A j \in 1..Len(cat.segs) : blob[cat.segs[j].name].ex
 
@@ -642,5 +679,5 @@ CopiesKnown ==
 
 Safety ==
   /\ ReadsAreSlices /\ AckedInLog /\ NamedExist /\ Readable /\ CheckpointsStable /\ CanEnd
-  /\ CopiesKnown /\ OthersKept
+  /\ CopiesKnown /\ OthersKept /\ VoidNotInLog
 =============================================================================

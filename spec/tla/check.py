@@ -157,6 +157,18 @@ CONFIGS = {
     # default) or probes and resends framed from the probed version's last trailer; with GC a
     # replace can make the object longer than the version a writer read.
     "probe": ({"TailReads": "FALSE"}, "pass"),
+    # long and faults2 as the probe path takes them (tail reads, the default since TAIL_READS
+    # step 5, read after a lost race instead): the witnesses of a shrunk file, a CAS after a
+    # fresh read and a final read are reached only there
+    "probe-long": ({"Shapes": "<- Long", "MaxCount": "2", "MaxAttempts": "4",
+                    "TailReads": "FALSE"}, "pass"),
+    "probe-faults2": ({"Shapes": "<- TwoEach", "MaxCount": "1", "MaxFaults": "2",
+                       "FaultKinds": ALL_FAULTS, "Strict": "TRUE", "TailReads": "FALSE"},
+                      "pass"),
+    # A writer whose probe found the file grown past the size knob reads it afresh, then CASes
+    # (FreshForCAS): bug26's configuration without its switch
+    "probe-size": ({"TailReads": "FALSE", "Strict": "TRUE", "MaxSize": "2",
+                    "Shapes": "<- TwoEach"}, "pass"),
     "probe-gc": ({"Retention": "0", "MaxTime": "2", "Shapes": "<- TwoEach", "MaxCount": "1",
                   "TailReads": "FALSE"}, "pass"),
     "probe-faults": ({"MaxFaults": "1", "FaultKinds": ALL_FAULTS, "Strict": "TRUE",
@@ -519,6 +531,10 @@ LOG_CONFIGS = {
     "log-void-lag": ({**COMPACT1, "Lag": "TRUE", "MaxFaults": "1", "FaultKinds": '{"void"}',
                       "MaxAttempts": "2"}, "pass"),
     "log-reads": ({**COMPACT1, "Lag": "TRUE", "MaxLooks": "2"}, "pass"),
+    # Two appends in flight, landing late around compaction (F3: a segmented log's append that
+    # waits behind an open segment lands later with no fault).
+    "log-inflight2-gc": ({**COMPACT1, "Shapes": "<- Blind", "MaxFaults": "2",
+                          "FaultKinds": '{"inflight"}'}, "pass"),
     "log-reads-faults": ({"Lag": "TRUE", "MaxLooks": "1", "MaxFaults": "1",
                           "FaultKinds": LOG_FAULTS}, "pass"),
     # Their switches: the last loss settled by a read that lags behind the tail it named (Bug
@@ -564,7 +580,7 @@ SG_BASE = {
     "Seal": "Seal",
 }
 SG_SAFETY = ["ReadsAreSlices", "AckedInLog", "NamedExist", "Readable", "CheckpointsStable",
-             "CanEnd", "CopiesKnown", "OthersKept"]
+             "CanEnd", "CopiesKnown", "OthersKept", "VoidNotInLog"]
 SG_ACTIONS = ["AbstractGrows"]
 SG_FAULTS = '{"lostReply", "notSent", "inflight", "shortRead"}'
 # Segments of two records in blobs of three blocks: room for a race inside a segment.
@@ -588,6 +604,13 @@ SG_CONFIGS = {
     "sg-faults": ({"MaxFaults": "1", "FaultKinds": SG_FAULTS, "MaxReads": "2"}, "pass"),
     "sg-faults-compact": ({**SG_NARROW, "MaxCkpt": "1", "MaxSweep": "1", "MaxFaults": "1",
                            "FaultKinds": SG_FAULTS}, "pass"),
+    # The 2026-11-17 review's F3: short reads on the writer's read-through (and of the
+    # segments before its copy); compaction with segments installed ahead and any segment
+    # taken (AnySeg, Ahead); copies with faults.
+    "sg-short": ({**SG_WIDE, "MaxFaults": "2", "FaultKinds": '{"shortRead"}'}, "pass"),
+    "sg-compact-ahead": ({**SG_COMPACT, "Recs": "<- OneEach", "MaxReads": "1"}, "pass"),
+    "sg-copies-faults": ({**SG_WIDE, "MaxCopies": "2", "MaxSends": "3", "MaxFaults": "1",
+                          "FaultKinds": SG_FAULTS}, "pass"),
     # The mistakes (LOG_SEGMENTS.md "Invariants"): each must break a property.
     "sg-catalogseal": ({**SG_WIDE, "Bugs": '{"catalogseal"}'}, SG_VOIDS),
     "sg-limitatnext": ({**SG_WIDE, "Bugs": '{"limitatnext"}'}, SG_VOIDS),
@@ -603,6 +626,10 @@ SG_CONFIGS = {
     "sg-sdkretry": ({**SG_WIDE, "MaxFaults": "1", "Bugs": '{"sdkretry"}'}, {"CopiesKnown"}),
     "sg-overlimit": ({"Limit": "3", "MaxBlocks": "2", "MaxReads": "0", "Bugs": '{"overlimit"}'},
                      {"CanEnd"}),
+    # A read-through that reads short of its copy, before any end, takes the copy for void,
+    # which it may not be (F3; the Bug 90 family).
+    "sg-shortvoid": ({"MaxReads": "0", "MaxFaults": "1", "FaultKinds": '{"shortRead"}',
+                      "Bugs": '{"shortvoid"}'}, {"VoidNotInLog"}),
 }
 
 MODELS = {"MC": (BASE, SAFETY, ACTIONS), "MCShared": (LOG_BASE, LOG_SAFETY, LOG_ACTIONS),
@@ -617,13 +644,14 @@ def model_of(name):
 
 # Witnesses: (config, Not_ invariant); TLC must report it violated.
 WITNESSES = [
-    ("long", "Not_Shrink"), ("mix", "Not_CasAfterFreshRead"), ("cas-only", "Not_Rebase"),
-    ("two-each", "Not_StaleAppend"), ("faults", "Not_Throttled"), ("seg", "Not_Full"),
-    ("faults2", "Not_FinalRead"), ("faults", "Not_LateLanding"),
-    ("faults", "Not_DuplicateRecord"), ("base", "Not_FailedButLanded"),
+    ("probe-long", "Not_Shrink"), ("probe-size", "Not_CasAfterFreshRead"),
+    ("cas-only", "Not_Rebase"),
+    ("probe", "Not_StaleAppend"), ("faults", "Not_Throttled"), ("seg", "Not_Full"),
+    ("probe-faults2", "Not_FinalRead"), ("faults", "Not_LateLanding"),
+    ("probe-faults", "Not_DuplicateRecord"), ("base", "Not_FailedButLanded"),
     ("gc0", "Not_Horizon"), ("gc0", "Not_GcRecord"), ("gc0", "Not_UnknownWithoutFault"),
     ("faults", "Not_Unknown"),
-    ("faults", "Not_CommittedAfterFault"), ("two-each", "Not_Overshoot"),
+    ("faults", "Not_CommittedAfterFault"), ("probe-gc", "Not_Overshoot"),
     ("faults2", "Not_Exhausted"),
     ("after-two-each", "Not_Judged"), ("base", "Not_FailedRaced"),
     ("page-faults", "Not_PastFaultOnly"), ("gc2", "Not_Horizon"),
@@ -655,7 +683,10 @@ WITNESSES = [
     ("page", "Not_Floor"), ("page", "Not_PageOutInLog"), ("page-faults", "Not_PagedOwnId"),
     ("page-faults", "Not_Orphan"), ("page-gc", "Not_Swept"), ("page-cas", "Not_TwoPages"),
     ("page-gc", "Not_PageBelowHorizon"), ("page-skew", "Not_Floor"),
-    ("page-probe", "Not_CopyBelowFloor"), ("page-admit", "Not_Floor"),
+    # A copy below the floor is reached on the probe path only by compaction after the commit
+    # (after-page-probe): a fused compaction replaces the object, and a probe after a replace
+    # reads, so page-probe sends no blind copy that a PageOut could pass
+    ("page-admit", "Not_Floor"),
     ("after-page-probe", "Not_CopyBelowFloor"),
     ("log-page", "Not_Floor"), ("log-page", "Not_PageOutRefused"), ("log-page", "Not_Orphan"),
     ("log-page-gc", "Not_Swept"), ("log-page2", "Not_Swept"), ("log-page", "Not_PagedOwnId"),
@@ -679,6 +710,7 @@ WITNESSES = [
     ("sg-compact", "Not_CheckpointMoved"), ("sg-compact", "Not_Retired"),
     ("sg-compact", "Not_Swept"), ("sg-compact", "Not_Writer404"), ("sg-compact", "Not_Reader404"),
     ("sg-faults", "Not_LateLanding"), ("sg-faults", "Not_Copy"),
+    ("sg-short", "Not_ShortReadThrough"),
 ]
 
 

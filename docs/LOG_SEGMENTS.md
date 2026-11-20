@@ -404,7 +404,8 @@ pages, and the catalog above the log.
 | SG10 | Every client of a log names its segments under one prefix, which never changes: the one its catalog object records, or the default. | The creator records its prefix unless it is the default; a checkpoint restates the object's; replay takes it only right after `checkpoint_through`; a client reads it before any request of a segment, and one that derives no default for an object recording none fails (D13). |
 
 The mistakes, each a switch that must break a property. The model (`SegmentedLog.tla`) has
-the first eleven, and the Java has each as a mutant:
+the first twelve, and the Java has each as a mutant but `shortvoid`, which the model alone
+holds:
 
 | Switch | The mistake | Breaks |
 |---|---|---|
@@ -419,6 +420,7 @@ the first eleven, and the Java has each as a mutant:
 | `sweepothers` | the sweep lists every log's segments at the prefix: Bug 100 (sweep deleted another log's segments) | SG6, and P1 and P5 for the other log: its named segments are deleted |
 | `sdkretry` | a timed-out append is resent below the runtime | the shared-log model's `dup` |
 | `overlimit` | an Install sets a limit above the store's block limit | SG8: a segment fills before its end, takes no seal frame, and the log stops |
+| `shortvoid` | `readThrough` takes a short read that neither reaches its copy nor shows the segment's end for void | D4: a copy judged void is in the log, and a commit all of whose sends were void is rejected though its record applied (the model's `VoidNotInLog`) |
 | `nested` | replay of a segment takes an Install or a Retired entry in it | SG1, SG4 |
 | `lastcopy` | `readThrough` decides by a later copy while an earlier one is in the log | an honest outcome, when a compaction drops the id between them (LOG.md's `dup`) |
 | `kbound` | a writer sizes its largest record by its own K, not the store's block limit: Bug 115 (segment that cannot end) | SG8: a writer with a small K fills a segment another installed with a larger K before its end, with no room for a seal, and the log stops |

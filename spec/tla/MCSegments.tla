@@ -35,6 +35,9 @@ Not_Writer404 == ~seen.w404
 Not_Reader404 == ~seen.r404
 Not_ReadNext == ~seen.rnext
 Not_LateLanding == ~seen.late
+\* A read-through read short of its copy, before any end, and read again; a
+\* copy judged void that a later Install's segment carries in the log.
+Not_ShortReadThrough == ~seen.shortrt
 \* A record twice in the log (a copy the runtime knew of).
 Not_Copy == \A i, j \in 1..Len(Abstract) : i # j => Abstract[i] # Abstract[j]
 =============================================================================

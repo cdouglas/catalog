@@ -185,8 +185,8 @@ goes in a replace, `oversized` in `mustReplace`: Bug 71, covered by
 
 ## Results
 
-Every configuration of the correct protocol passes. `check.py` holds 207
-configurations (122 of the file model, 65 `log-*`, 20 `sg-*`), 131 of them
+Every configuration of the correct protocol passes. `check.py` holds 215
+configurations (125 of the file model, 66 `log-*`, 24 `sg-*`), 138 of them
 expected to pass; the rest are bug switches, each expected to break a
 property. The state counts in this file's tables are from `check.py`'s full
 run at 4c685a3 (2026-11-11: the 138 configurations it held then, about six
@@ -484,9 +484,10 @@ Every configuration of the correct protocol passes:
 | `log-cond-faults`, `log-cond-faults2` | with every fault, `condLanded` and `void` among them, lagging reads; two faults within two attempts | 1,492; 6,031 |
 | `log-void`, `log-void-lag` | void appends (and throttles); one with compaction and lagging reads | 544; 62,977 |
 | `log-reads`, `log-reads-faults` | catalogs' reads outside a commit (`Look`), with compaction and lagging reads; with every fault | 2,430,667; 15,013 |
+| `log-inflight2-gc` | two appends in flight, landing late around compaction (as a segmented log's append waits behind an open segment and lands later with no fault) | 1,780,124 |
 
-The `log-cond*`, `log-void*` and `log-reads*` counts are of 2026-11-20 (the
-review's F7).
+The `log-cond*`, `log-void*`, `log-reads*` and `log-inflight2-gc` counts are of
+2026-11-20 (the review's F7 and F3).
 
 **Coverage.** `check.py --witnesses` reaches, in the passing configurations:
 
@@ -978,6 +979,7 @@ checkpoint it stores is not the replay of the log through its position
 | Config | What it adds |
 |---|---|
 | `probe`, `probe-gc`, `probe-faults` | the probe path (`TailReads` FALSE): base, with GC (a replace can grow the object past a writer's version), with every fault |
+| `probe-long`, `probe-faults2`, `probe-size` | the probe path on `long`'s, `faults2`'s and `bug26`'s bounds (538; 194,865; 1,125 states, 2026-11-20) |
 | `tail-long` | tail reads with the shrink path and GC |
 | `lengthonly`, `notrailer`, `probeinc` | the switches above, on `gc0`'s bounds (`probeinc` on the probe path) |
 | `log-nojoint` | the shared log's switch, with compaction |
@@ -986,7 +988,13 @@ Every other configuration runs with tail reads (the state counts in "Results"
 above predate them: `gc0`, for one, now has 21,777 states). Bugs 26, 64a and `floorgap`
 need a resend after a probe without a read, so their calibrations run on the
 probe path: with tail reads the loop reads before it resends, and a read that
-puts the commit's id at or below the horizon ends it.
+puts the commit's id at or below the horizon ends it. For the same reason the
+witnesses of the probe path's states (a stale append, a file that shrank, a CAS
+after a fresh read, the last attempt's final read, the append count overshot,
+a record in the log twice) are reached only there: `probe`, `probe-gc`,
+`probe-faults`, `probe-long`, `probe-faults2` and `probe-size` (on `two-each`,
+`long`, `mix`, `faults2` and `faults`, where they were until tail reads became
+the default, nothing reaches them; found by the full witness run of 2026-11-20).
 
 ## Compaction after the commit
 
@@ -1125,7 +1133,10 @@ configurations are `sg-*`, through `MCSegments.tla`.
 - **The read-through** takes the copies in ordinal order. Each needs the segments before its
   own ended: the writer reads each one it hasn't seen end, and appends a seal frame to one that
   hasn't. A copy is acknowledged if its segment hadn't ended before it; else the next copy, or
-  a send to a later segment.
+  a send to a later segment. Its reads may come back short (a fault): a short read of an
+  earlier segment that shows no end is sealed; one of the copy's segment that neither reaches
+  the copy nor shows its end says nothing, and the writer reads again (the Java tells "ended
+  before the copy" from "read short of it").
 - **Compactors** put a checkpoint at a record boundary in the log and CAS-replace the catalog
   object with it, retiring the segments before its own. The sweep (at TTL 0) deletes a retired
   segment, or an unnamed blob at or below the newest Install's ordinal, of this log's blobs
@@ -1150,6 +1161,12 @@ through the first that hasn't ended.
 | `CanEnd` | SG8: a segment that hasn't ended has room for a seal frame |
 | `CopiesKnown` | no copy of a record is in the log that its writer doesn't know may have landed (the shared-log model's `dup`) |
 | `OthersKept` | another log's segment at the same prefix, which its catalog object names, exists: Bug 100 (sweep deleted another log's segments) |
+| `VoidNotInLog` | D4: a copy its writer judged void (by the reply's block count, or by a read that showed its segment ended before it) is never in the log; the runtime takes a void append for a lost race with nothing to resolve |
+
+Not modelled: the view `readThrough` and `readAfter` return beyond the copy's place
+(`AckedInLog`; the Java assembles it from a kept view and several walks), and faults of the
+catalog object's own writes (an Install or a checkpoint replace with its reply lost), which
+the version condition should make harmless (the 2026-11-17 review's F3, items 3 and 4).
 
 **Results** (2026-11-15). Every passing configuration holds:
 
@@ -1162,8 +1179,9 @@ through the first that hasn't ended.
 | `sg-copies` | two copies of a record, K = 2 | 36,902 |
 | `sg-three` | three writers | 11,844 |
 | `sg-compact` | a checkpoint and two sweeps, over two rotations; two reads | 308,175 |
-| `sg-faults` | one fault: lost reply, not sent, in flight, short read | 247,120 |
-| `sg-faults-compact` | a fault, with a checkpoint and a sweep | 154,842 |
+| `sg-faults` | one fault: lost reply, not sent, in flight, short read (of a reader's segment, or of the read-through's) | 262,970 |
+| `sg-faults-compact` | a fault, with a checkpoint and a sweep | 157,574 |
+| `sg-short` | two short reads, K = 2 in blobs of three blocks (2026-11-20) | 68,778 |
 
 The larger scenarios narrow writers' choices (`AnySeg` and `Ahead` false): with both open,
 `sg-two-each` had not finished after 15 minutes.
@@ -1180,9 +1198,10 @@ Each bug switch (LOG_SEGMENTS.md "Invariants") breaks a property:
 | `createonmissing` (a writer creates a swept segment) | `AckedInLog` |
 | `sweepearly` (the sweep deletes a named segment) | `NamedExist` |
 | `sweepinflight` (the sweep deletes an unnamed blob of any ordinal) | `NamedExist` |
-| `sweepothers` (the sweep lists every log's blobs at the prefix; added 2026-11-17, not yet run) | `OthersKept` |
+| `sweepothers` (the sweep lists every log's blobs at the prefix) | `OthersKept` |
 | `sdkretry` (the SDK resends a timed-out append) | `CopiesKnown` |
 | `overlimit` (an Install sets a limit above the block limit) | `CanEnd` |
+| `shortvoid` (the read-through takes a short read that neither reaches its copy nor shows its segment's end for void; the Bug 90 family) | `VoidNotInLog` |
 
 `catalogseal`'s trace is D1's example: writer 1 installs segment 1 ahead, sends its record
 there, and reads segment 0 empty to end it; writer 2's record lands in segment 0 and is in the
@@ -1192,7 +1211,8 @@ The witnesses (`check.py --witnesses -k sg-`) are each reached:
 - writes: a rotation, two rotations, two segments open at once, a record waiting in a segment
   after an open one, a seal frame, a segment ended by its limit, a copy void by its reply and
   one void on a read, a record acknowledged at its second copy, a block-limit refusal, a lost
-  Install, a late landing, and a record in the log twice;
+  Install, a late landing, a record in the log twice, and a read-through that read short of its
+  copy and read again;
 - compaction: a checkpoint moved, a segment retired and one swept;
 - reads: a reader stepping past an ended last segment, and a 404 for a stale writer and for a
   stale reader.
