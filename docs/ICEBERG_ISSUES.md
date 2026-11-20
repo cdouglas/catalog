@@ -102,7 +102,7 @@ Fork column is `atomicio`, which sits on
 | C10. An expiry that retries fails on what its first attempt removed | fixed, `core-fixes` 8900018 | yes | yes | not reported |
 | C11. An append commits files of a spec another writer removed | fixed, `core-fixes` 69e83ef | yes | yes | not reported |
 | C12. An expiry follows the GC and retention settings of when it was created | fixed, `core-fixes` 0824e0d | yes | yes | `gc.enabled`: PR [#17791](https://github.com/apache/iceberg/pull/17791), open; retention: not reported |
-| C13. An expiry that committed reports a failure when its cleanup fails | fixed, `core-fixes` 7f3708a | yes | yes | not reported |
+| C13. An expiry that committed reports a failure when its cleanup fails | fixed, `core-fixes` 7f3708a, 078b3c69b4 | yes | yes | not reported |
 | C14. A cherry-pick of a snapshot expired since it was picked fails with an NPE | fixed, `core-fixes` b1f2e01 | yes | yes | not reported |
 | C15. An expiry in a transaction deletes files before the transaction commits | fixed, `core-fixes` 44fce44 | yes | yes | reported: [#18737](https://github.com/apache/iceberg/issues/18737) (open, 2026-11-01); a regression from [#13631](https://github.com/apache/iceberg/pull/13631), in 1.10.0 |
 | C16. A rollback undoes another writer's rollback | fixed, `core-fixes` 14d869e | yes | yes | not reported |
@@ -532,9 +532,16 @@ files behind.
   fuzzer saw it once an expiry could remove a ref its model follows.
   Reproduces on `InMemoryCatalog`.
 - **Fork:** fixed on `core-fixes` by 7f3708a, "Core: Let an expiry that
-  committed stand when its file cleanup fails". Its tests are
-  `TestRemoveSnapshots.testCommittedExpiryWhoseRefreshFails` and
-  `testCommittedExpiryWhoseCleanupFails`.
+  committed stand when its file cleanup fails", and 078b3c69b4, "Core: Let
+  an expiry stand when the table it reads back cannot load its snapshots"
+  (2026-11-20). A table read back lazily (a REST catalog's refs mode, or
+  FileIOCatalog with paged history) loads its other snapshots when asked.
+  The cleanup asked after the refresh, outside the first fix's handler:
+  round p19-r0's faultB2.3 and faultB2.4, where a lost page failed an
+  expiry that had committed. Its tests are
+  `TestRemoveSnapshots.testCommittedExpiryWhoseRefreshFails`,
+  `testCommittedExpiryWhoseCleanupFails` and
+  `testCommittedExpiryWhoseSnapshotsCannotBeReadBack`.
 - **No workaround** to remove.
 - **Canary:** `anExpiryThatCommittedDoesNotFailOnItsCleanup`.
 

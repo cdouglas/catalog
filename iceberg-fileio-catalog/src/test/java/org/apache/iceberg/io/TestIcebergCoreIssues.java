@@ -405,7 +405,7 @@ class TestIcebergCoreIssues {
   /**
    * C13. An expiry that committed must not report a failure because its cleanup of the expired
    * files failed: RemoveSnapshots let a failure to read the table back after the commit escape
-   * commit().
+   * commit(), and a failure to load the snapshots of a table read back lazily.
    */
   @Test
   void anExpiryThatCommittedDoesNotFailOnItsCleanup() throws InterruptedException {
@@ -437,6 +437,49 @@ class TestIcebergCoreIssues {
         .expireOlderThan(now).commit());
     assertThat(committed[0]).isTrue();
     assertThat(failure).as(BACK, "C13").isNull();
+
+    // Nor because the snapshots it reads back cannot be read: a table loaded lazily, as REST's
+    // refs mode loads one (and FileIOCatalog one that pages its history), reads the snapshots its
+    // refs do not name only when asked, which the cleanup does after the commit (p19-r0, a page
+    // the cleanup read was lost)
+    InMemoryCatalog lazyCatalog = catalog();
+    Table lazy = lazyCatalog.createTable(ID, SCHEMA);
+    lazy.newFastAppend().appendFile(file("a")).commit();
+    lazy.newFastAppend().appendFile(file("b")).commit();
+    Thread.sleep(2);
+    long later = System.currentTimeMillis();
+    boolean[] landed = {false};
+    Table failingLoad = new BaseTable(new Forwarding(lazy) {
+      @Override
+      public void commit(TableMetadata base, TableMetadata metadata) {
+        super.commit(base, metadata);
+        landed[0] = true;
+      }
+
+      @Override
+      public TableMetadata refresh() {
+        TableMetadata loaded = super.refresh();
+        if (!landed[0]) {
+          return loaded;
+        }
+        TableMetadata refs = TableMetadata.buildFrom(loaded)
+            .withMetadataLocation(loaded.metadataFileLocation())
+            .suppressHistoricalSnapshots()
+            .build();
+        return TableMetadata.buildFrom(refs)
+            .withMetadataLocation(refs.metadataFileLocation())
+            .setPreviousFileLocation(null)
+            .setSnapshotsSupplier(() -> {
+              throw new UncheckedIOException(new IOException("injected: snapshots unavailable"));
+            })
+            .discardChanges()
+            .build();
+      }
+    }, lazy.name());
+    Throwable lazyFailure = catchThrowable(() -> failingLoad.expireSnapshots()
+        .expireOlderThan(later).commit());
+    assertThat(landed[0]).isTrue();
+    assertThat(lazyFailure).as(BACK, "C13").isNull();
   }
 
   /**
