@@ -84,7 +84,8 @@ import org.apache.iceberg.io.InMemoryAtomicFileIO.Fault;
  * <p>In half the tries, each property but the reads oracle runs its subject without snapshot
  * paging beside a twin paged at a drawn block and window (SNAPSHOT_PAGING.md, "Testing"): the
  * twin must end as its own reference does, and admit R's record as the subject does, but where
- * it needs a snapshot the window sealed ({@link #admission}).
+ * it needs a snapshot the window sealed ({@link #admission}). It found Bug 129 (sealed rejections
+ * misattributed).
  *
  * <p>{@link #aMergedAppendIsWhatItsRetryWouldCommit} probes the merge ({@link Landing}) on its own:
  * its subject admits every delta that can be finalized where it lands ({@link

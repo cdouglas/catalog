@@ -22,7 +22,12 @@
 # too: a probe of aBlindAppendIsWhatItsRetryWouldCommit (300 tries, 2026-11-18) saw the DROP stamp
 # move under a merged blind record 8 times, each refused by Landing ("merge: a manifest it removes
 # is not in its branch's head") or a concern; 1,000 tries admitted none past a moved DROP stamp.
-MUTANTS="minseqshift blindunguarded listfilestamp"
+# sealedlast undoes Bug 129's fix (sealed rejections misattributed): a table update explains its
+# rejection by the conflict encoding's reason before the sealed snapshot it needed, so a merge whose
+# parent a window sealed says its parent's summary is gone. The rebase oracle's paged twin (gap plan
+# 2.9: in half the tries, an unpaged subject beside a paged twin) found the bug at tries 7 to 27 of
+# four properties; it may reject a record the subject admits only for a reason that says sealed.
+MUTANTS="minseqshift blindunguarded listfilestamp sealedlast"
 EQUIVALENT="blindnodrop"
 ORACLES=TestRebaseProperties,TestBlindAppendEncoding,TestPartitionVectorEncoding,TestManifestWindowEncoding
 
@@ -45,6 +50,22 @@ mutant() { # name main-dir test-dir
                     || adds.get(first).footprint.kind != Footprint.Kind.BLIND)) {" ;;
     # a snapshot with a manifest-list file stamps no partition
     listfilestamp) mutate $M/BlindAppendEncoding.java "      if (!add.manifestListSuffix.isEmpty()) {" "      if (false) {" ;;
+    # a rejection explained by the encoding before the sealed snapshot it needed (Bug 129)
+    sealedlast) mutate $M/ProtoCodec.java "      String needed = sealedSnapshotNeeded(builder);
+      if (needed != null) {
+        return needed;
+      }
+      String why = ConflictEncodings.rejection(table(), builder);
+      if (why != null) {
+        return why;
+      }" "      String why = ConflictEncodings.rejection(table(), builder);
+      if (why != null) {
+        return why;
+      }
+      String needed = sealedSnapshotNeeded(builder);
+      if (needed != null) {
+        return needed;
+      }" ;;
     # blind-append's read of dropped manifests alone (equivalent, above)
     blindnodrop) mutate $M/BlindAppendEncoding.java "    if (!change.drops.isEmpty()) {
       witness.ref(change.advanced.iterator().next(), ConcernStamps.Ref.DROP);

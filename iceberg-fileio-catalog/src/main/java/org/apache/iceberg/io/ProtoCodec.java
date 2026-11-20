@@ -3460,17 +3460,22 @@ public class ProtoCodec {
     }
 
     /**
+     * Why snapshot paging keeps the update from applying, or null: its import blocks ({@link
+     * #imports}), or a sealed snapshot it needs ({@link #sealedSnapshotNeeded}).
+     */
+    private String sealed(CatalogState.Builder builder) {
+      String imports = imports(builder);
+      return imports != null ? imports : sealedSnapshotNeeded(builder);
+    }
+
+    /**
      * Why the update needs a sealed snapshot's content without carrying it, or null
      * (SNAPSHOT_PAGING.md, "Bringing a sealed snapshot back"): a delta's parent, ref target or
      * window ({@link SnapshotSealing#reason}); a head-only full update that holds a snapshot the
      * table keeps sealed (its writer sends only the snapshots its base lacks, and a sealed one
      * comes back only with its proof).
      */
-    private String sealed(CatalogState.Builder builder) {
-      String imports = imports(builder);
-      if (imports != null) {
-        return imports;
-      }
+    private String sealedSnapshotNeeded(CatalogState.Builder builder) {
       if (!builder.isInlineTable(id) || builder.sealedBlocks(id).isEmpty()) {
         return broughtBack.isEmpty() ? null : "sealed: brings back a snapshot of no sealed block";
       }
@@ -3506,8 +3511,19 @@ public class ProtoCodec {
       return headOnly && fullMetadata != null && !builder.isInlineTable(id);
     }
 
+    /**
+     * Why the update does not apply. A sealed snapshot it needed comes first (Bug 129 (sealed
+     * rejections misattributed)): where one is, what an encoding's judgment or the merge read
+     * of the table lacked it, and its reason (a merge's parent "gone", a window's parent "not an
+     * ancestor") would count a record paging rejected as a conflict. Import blocks the table
+     * where it lands cannot take come last, as the rest of {@link #sealed}.
+     */
     @Override
     public String explain(CatalogState.Builder builder) {
+      String needed = sealedSnapshotNeeded(builder);
+      if (needed != null) {
+        return needed;
+      }
       String why = ConflictEncodings.rejection(table(), builder);
       if (why != null) {
         return why;
@@ -3518,7 +3534,7 @@ public class ProtoCodec {
       if (headOnlyOnAPointerTable(builder)) {
         return "full: head only on a pointer table";
       }
-      return sealed(builder);
+      return imports(builder);
     }
 
     /**

@@ -8920,4 +8920,57 @@ public class TestCatalogRegressions {
       assertThatThrownBy(() -> mut.dropTable(u)).isInstanceOf(NoSuchTableException.class);
     }
   }
+
+  /**
+   * Bug 129 (sealed rejections misattributed): a record that needs a snapshot sealed since its
+   * writer read the table (its parent, or one on its branch back to it) is rejected, and Iceberg
+   * retries it, but its reason was the conflict encoding's: a merge that finds its parent's
+   * summary gone, or a window whose parent "is not an ancestor of its branch's head", which the
+   * conflict counts (and catalog-bench's conflict reasons) then took for conflicts. The rebase
+   * oracle's paged twin found it (gap plan 2.9): its unpaged subject merged these records, or
+   * rejected them for another reason. A table update now explains a rejection by the sealed
+   * snapshot it needed first ({@code sealed: ...}), and its import blocks last, as before.
+   */
+  @Nested
+  class SealedRejectionsSaySealed {
+    @Test
+    void aMergeWhoseParentWasSealed() {
+      TestRebaseProperties.verify(BlindAppendEncoding.NAME, 2, true, LocalCatalogMode.APPEND_ML,
+          true, false, List.of(),
+          List.of(cmd(TableScript.Kind.FAST_APPEND, 0, 0, 0)),
+          List.of(cmd(TableScript.Kind.FAST_APPEND, 4, 0, 9),
+              cmd(TableScript.Kind.FAST_APPEND, 5, 8, 0)),
+          cmd(TableScript.Kind.BRANCH_APPEND, 2, 10, 2), new int[] {1, 1});
+    }
+
+    @Test
+    void aWindowThatReachesASealedSnapshot() {
+      TestRebaseProperties.verify(ManifestWindowEncoding.NAME, 2, true, LocalCatalogMode.CAS_ML,
+          true, true, List.of(),
+          List.of(cmd(TableScript.Kind.MERGE_APPEND, 11, 1, 9),
+              cmd(TableScript.Kind.MERGE_APPEND, 1, 1, 5),
+              cmd(TableScript.Kind.FAST_APPEND, 2, 1, 9)),
+          List.of(cmd(TableScript.Kind.FAST_APPEND, 4, 1, 0),
+              cmd(TableScript.Kind.EQUALITY_DELETE, 8, 1, 0),
+              cmd(TableScript.Kind.DELETE_PARTITION, 6, 1, 1)),
+          cmd(TableScript.Kind.DELETE_PARTITION, 3, 1, 1), new int[] {1, 0});
+    }
+
+    /**
+     * Only the sealed snapshots come first: a full update whose import blocks the table where it
+     * lands cannot take (a writer re-inlining a table the window changed) still says what its
+     * encoding says, as an unpaged catalog does.
+     */
+    @Test
+    void anImportItsTableCannotTakeKeepsTheEncodingsReason() {
+      TestRebaseProperties.verify(AdmitDeltasEncoding.register(), 2, true,
+          LocalCatalogMode.APPEND_ML, true, false, List.of(),
+          List.of(cmd(TableScript.Kind.FAST_APPEND, 0, 0, 0),
+              cmd(TableScript.Kind.UPGRADE, 0, 0, 0),
+              cmd(TableScript.Kind.POSITION_DELETE, 10, 7, 1),
+              cmd(TableScript.Kind.CATALOG_TXN, 10, 3, 7)),
+          List.of(cmd(TableScript.Kind.MERGE_APPEND, 4, 0, 7)),
+          cmd(TableScript.Kind.MERGE_APPEND, 11, 11, 0), new int[] {1, 0});
+    }
+  }
 }

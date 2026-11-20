@@ -249,7 +249,11 @@ Any other record that needs a sealed snapshot's content conflicts with the
 same reason: a commit whose parent is sealed (a stale writer, a stale
 branch), or a window that reaches one. This is stable (S2): blocks only
 become sealed, so a record that conflicts where it lands would conflict
-anywhere later.
+anywhere later. The sealed reason comes before the conflict encoding's, which
+judged a table that lacked the snapshot (a merge whose parent's summary is
+gone, a window whose parent "is not an ancestor"): conflict counts would
+otherwise take a record paging rejected for a conflict (Bug 129 (sealed
+rejections misattributed)).
 
 ## Expiry
 
@@ -731,7 +735,7 @@ four tables). With paging set:
   reference does. R lands behind a window, which often seals what R built
   on. The twin may reject R's record where the subject admits it only with a
   reason that says `sealed`; its other rejections must be the subject's, and
-  it must admit nothing the subject rejects.
+  it must admit nothing the subject rejects. It found Bug 129.
 
 A round's faultA2 and faultB2 run at B = 2, W = 1, which reaches sealed
 blocks and import pages (step 5); the fault fuzzer reports the most sealed
