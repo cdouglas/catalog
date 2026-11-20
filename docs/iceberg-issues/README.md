@@ -33,7 +33,9 @@ unchanged on `main` at `a6bc1f95e3`, and it applies there on its own.
 C31, added 2026-11-18, was written on 1.12.0 (`core-fixes`); the method it
 changes is unchanged on `main` at `a6bc1f95e3`. C32, added 2026-11-18, was
 written on 1.12.0 (`core-fixes`); the method it changes is unchanged on
-`main` at `a6bc1f95e3`.
+`main` at `a6bc1f95e3`. C33, added 2026-11-19, was written on 1.12.0 after
+C28; its main change applies on `main` at `e70a2efcd0` on its own, and its
+test file needs a one-line merge of imports without C28.
 
 | Issue | Fix | Before a PR |
 |---|---|---|
@@ -69,3 +71,4 @@ written on 1.12.0 (`core-fixes`); the method it changes is unchanged on
 | [C30. A removal of more snapshots than a table has fails with IllegalArgumentException](C30.md) | [`e1853ce`](https://github.com/cdouglas/iceberg/commit/e1853cec0b601e887340ad6b681a055e4dad212d) | ready; one line: settle with reviewers that a removal of snapshots already gone is a no-op, not a conflict; #13647's thread expects bulk updates back, which makes it reachable from Java's client |
 | [C31. An expiry cleans up the files of snapshots another writer removed](C31.md) | [`67a523a`](https://github.com/cdouglas/iceberg/commit/67a523ae14) | not reported: open an issue with the reproduction, leading with the window after the commit (any catalog); Spark's action is a second change |
 | [C32. A partitions-table row depends on the order its manifests are read](C32.md) | [`c82e05c`](https://github.com/cdouglas/iceberg/commit/c82e05cd72a0f7b822cd43fdd5542620b2ff995e) | ready: a PR with the test; settle which spec a tie reports (the greatest id here); cite #4516's review |
+| [C33. A JDBC namespace property set fails when another writer sets or removes one of its keys](C33.md) | [`d4cc466`](https://github.com/cdouglas/iceberg/commit/d4cc46604d) | ready: a PR with the tests, citing #4220's review; settle the retry bound; `createNamespace`'s sibling race is a separate change |

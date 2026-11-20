@@ -70,7 +70,7 @@ import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 /**
- * Canaries for the Iceberg core bugs this project's fuzzers and reviews found, C1 to C31 in
+ * Canaries for the Iceberg core bugs this project's fuzzers and reviews found, C1 to C33 in
  * docs/ICEBERG_ISSUES.md: one test each, on Iceberg's own InMemoryCatalog, that asserts the bug is
  * absent. Upstream fixed C1, and the fork's core-fixes branch fixes the others, so every test
  * passes against the fork. A test that fails means its bug is back: a rebase dropped the fork's
@@ -1064,6 +1064,88 @@ class TestIcebergCoreIssues {
     String reversed =
         TestMetadataTableOrder.partitionSpecIds(table, new TestMetadataTableOrder.Reversing(2));
     assertThat(reversed).as(BACK, "C32").isEqualTo(inOrder);
+  }
+
+  /**
+   * C33. A JDBC set of a namespace's properties must land whole when another writer inserts or
+   * removes one of its keys between its read of the properties and its writes: the set read them to
+   * choose an INSERT or an UPDATE per key and ran each as a statement of its own, so the INSERT of
+   * a key inserted since failed on the primary key (UncheckedSQLException) and the UPDATE of one
+   * removed since matched no row (IllegalStateException, after the INSERT of the others committed).
+   * JdbcCatalog on SQLite; the other writer is a second catalog on the same database.
+   */
+  @Test
+  void aJdbcPropertySetRacingAnotherWriterLandsWhole() throws IOException {
+    java.nio.file.Path db = java.nio.file.Files.createTempFile("c33", ".db");
+    java.util.concurrent.atomic.AtomicReference<Runnable> beforeWrite =
+        new java.util.concurrent.atomic.AtomicReference<>();
+    org.apache.iceberg.jdbc.JdbcCatalog racing = jdbcCatalog(db, beforeWrite);
+    org.apache.iceberg.jdbc.JdbcCatalog other =
+        jdbcCatalog(db, new java.util.concurrent.atomic.AtomicReference<>());
+    Namespace inserted = Namespace.of("inserted");
+    Namespace removed = Namespace.of("removed");
+    racing.createNamespace(inserted);
+    racing.createNamespace(removed, Map.of("k", "v0"));
+
+    beforeWrite.set(() -> other.setProperties(inserted, Map.of("k", "theirs")));
+    assertThatCode(() -> racing.setProperties(inserted, Map.of("k", "mine")))
+        .as(BACK, "C33")
+        .doesNotThrowAnyException();
+    assertThat(beforeWrite.get()).as("the other writer raced the set").isNull();
+    assertThat(other.loadNamespaceMetadata(inserted)).as(BACK, "C33").containsEntry("k", "mine");
+
+    beforeWrite.set(() -> other.removeProperties(removed, Set.of("k")));
+    assertThatCode(() -> racing.setProperties(removed, Map.of("k", "mine", "n", "new")))
+        .as(BACK, "C33")
+        .doesNotThrowAnyException();
+    assertThat(beforeWrite.get()).as("the other writer raced the set").isNull();
+    assertThat(other.loadNamespaceMetadata(removed))
+        .as(BACK, "C33")
+        .containsEntry("k", "mine")
+        .containsEntry("n", "new");
+  }
+
+  /**
+   * A JdbcCatalog on the SQLite database {@code db} whose connections run what {@code beforeWrite}
+   * holds before preparing each statement that writes namespace properties.
+   */
+  private static org.apache.iceberg.jdbc.JdbcCatalog jdbcCatalog(
+      java.nio.file.Path db, java.util.concurrent.atomic.AtomicReference<Runnable> beforeWrite) {
+    org.apache.iceberg.jdbc.JdbcCatalog catalog =
+        new org.apache.iceberg.jdbc.JdbcCatalog(
+            props -> new org.apache.iceberg.inmemory.InMemoryFileIO(),
+            props ->
+                new org.apache.iceberg.jdbc.JdbcClientPool(props.get(CatalogProperties.URI), props) {
+                  @Override
+                  protected java.sql.Connection newClient() {
+                    java.sql.Connection connection = super.newClient();
+                    return (java.sql.Connection)
+                        java.lang.reflect.Proxy.newProxyInstance(
+                            java.sql.Connection.class.getClassLoader(),
+                            new Class<?>[] {java.sql.Connection.class},
+                            (proxy, method, args) -> {
+                              if (method.getName().equals("prepareStatement")
+                                  && args[0] instanceof String
+                                  && (((String) args[0])
+                                          .startsWith("INSERT INTO iceberg_namespace_properties")
+                                      || ((String) args[0])
+                                          .startsWith("UPDATE iceberg_namespace_properties"))) {
+                                Runnable before = beforeWrite.getAndSet(null);
+                                if (before != null) {
+                                  before.run();
+                                }
+                              }
+                              return LostReplyPool.invoke(connection, method, args);
+                            });
+                  }
+                },
+            true);
+    catalog.initialize(
+        "c33",
+        Map.of(
+            CatalogProperties.URI, "jdbc:sqlite:" + db.toAbsolutePath(),
+            CatalogProperties.WAREHOUSE_LOCATION, "mem:///" + UUID.randomUUID()));
+    return catalog;
   }
 
   /**

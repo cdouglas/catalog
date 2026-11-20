@@ -4,7 +4,8 @@ Bugs in Apache Iceberg that this project's fuzzers found, and, from C15
 on, a review of Iceberg's commit retry paths that the fuzzers' finds
 prompted. None is in `FileIOCatalog`: each one reproduces on Iceberg's
 own `InMemoryCatalog`, directly or, for C21 and C22, by applying a
-client's updates through `CatalogHandlers` as a REST server does. C23
+client's updates through `CatalogHandlers` as a REST server does, or,
+for C28 and C33, on its `JdbcCatalog` over SQLite. C23
 was accepted behavior (A1) until the review, on 2026-10-20, showed which
 part of it upstream itself calls a bug.
 This page records them for a rebase onto a newer Iceberg. Each issue also
@@ -13,12 +14,13 @@ reports or pull requests upstream. It covers the reproduction, the cause
 with links to the 1.12.0 source, the fix, its tests, and what to settle
 before a PR.
 
-Upstream fixed C1. The fork fixes C2 to C32 on branch `core-fixes`, each
+Upstream fixed C1. The fork fixes C2 to C33 on branch `core-fixes`, each
 in an upstream-style commit with its tests, so the project's tests no
 longer work around any of them.
 
-`TestIcebergCoreIssues` has a canary for each issue up to C32: a test on
-`InMemoryCatalog` that asserts the bug is absent, with the message
+`TestIcebergCoreIssues` has a canary for each issue up to C33: a test on
+`InMemoryCatalog` (on `JdbcCatalog` over SQLite for C28 and C33) that
+asserts the bug is absent, with the message
 "Iceberg issue C*n* is back". Every canary passes against the fork. A
 canary that fails means a rebase dropped the fork's fix, or a release
 changed the behavior. The canaries assert only that the bug is absent,
@@ -76,7 +78,11 @@ C31, which a check of Iceberg's catalogs for fileio-catalog's Bug 117
 fork fixed it the same day. C32, which fileio-catalog's differential
 fuzzer found in round p12-r0p (2026-11-17), reproduces on 1.12.0 and on
 main at `a6bc1f95e3`; upstream has no report of it, and the fork fixed it
-on 2026-11-18. The Fork column is `atomicio`, which sits on
+on 2026-11-18. C33, which catalog-bench's E7 campaign found on 2026-11-19
+(JDBC namespace property updates failing under concurrency), reproduces
+on 1.12.0 and on main at `e70a2efcd0`; upstream has no report of it,
+though #4220's review noted in 2022 that the method isn't atomic, and the
+fork fixed it the same day. The Fork column is `atomicio`, which sits on
 `core-perf`, on `core-fixes`.
 
 | Issue | Fork | 1.12.0 | main | Upstream |
@@ -113,6 +119,7 @@ on 2026-11-18. The Fork column is `atomicio`, which sits on
 | C30. A removal of more snapshots than a table has fails with IllegalArgumentException | fixed, `core-fixes` e1853ce | yes | yes | not reported (2026-11-17); Java's client sends one update per snapshot since 1.9.1 (#13100, #13647), which meets it only on a table with no snapshots |
 | C31. An expiry cleans up the files of snapshots another writer removed | fixed, `core-fixes` 67a523a | yes | yes | not reported (2026-11-18); [#13568](https://github.com/apache/iceberg/issues/13568), fixed by [#13614](https://github.com/apache/iceberg/pull/13614), the nearest: incremental cleanup's choice, not its base |
 | C32. A partitions-table row depends on the order its manifests are read | fixed, `core-fixes` c82e05c | yes | yes | not reported (2026-11-18); #4516's review asked whether such a row would show "a random one" |
+| C33. A JDBC namespace property set fails when another writer sets or removes one of its keys | fixed, `core-fixes` d4cc466 | yes | yes | not reported (2026-11-19); [#4220](https://github.com/apache/iceberg/pull/4220)'s review noted it isn't atomic, and rdblue answered that generic SQL has no upsert |
 
 "Not reported" means a search of apache/iceberg's issues, pull requests
 and PR branches, and of the issues@ and dev@ lists, found nothing for the
@@ -121,7 +128,8 @@ issue (2026-10-21).
 ## Rebasing onto a newer Iceberg
 
 The fork fixes these issues itself, each in a commit of its own on branch
-`core-fixes`, which sits on the release; `atomicio` sits on `core-fixes`.
+`core-fixes`, which sits on the release; `core-perf` sits on `core-fixes`,
+and `atomicio` on `core-perf`.
 Each fix carries an upstream-style test in iceberg-core, and the issue's
 workarounds here are gone.
 
@@ -130,7 +138,7 @@ workarounds here are gone.
    merged comes out empty or conflicts. Before dropping it, check that
    its tests and its canary in `TestIcebergCoreIssues` pass on the new
    release without it.
-2. Rebase `atomicio` onto `core-fixes`.
+2. Rebase `core-perf` onto `core-fixes`, then `atomicio` onto `core-perf`.
 3. Run the full `iceberg-core` tests on `core-fixes`. Then run
    fileio-catalog's suite on the published fork: its canaries
    (`TestIcebergCoreIssues`) must all pass. Then run the fuzzers long:
@@ -1008,6 +1016,34 @@ two snapshots that touch it share a millisecond, on
   way.
 - **Canary:** `aPartitionsRowIsTheSameInAnyManifestOrder`: a row delta's
   data file and delete file under two specs, read in both orders.
+
+### C33. A JDBC namespace property set fails when another writer sets or removes one of its keys
+
+Details: [iceberg-issues/C33.md](iceberg-issues/C33.md).
+
+`JdbcCatalog.setProperties` reads a namespace's properties, then INSERTs
+the keys it did not find and UPDATEs those it did, each statement
+committing on its own. Another writer that inserts one of the new keys in
+between makes the INSERT fail on the primary key (`UncheckedSQLException`).
+One that removes a key to update makes the UPDATE match no row
+(`IllegalStateException`), after the INSERT of the set's other keys
+committed.
+
+- **Cause:** a read, then two statements in auto-commit mode, with no
+  handling of a key inserted or removed since the read.
+- **Found by:** catalog-bench's E7 campaign (2026-11-19): 16 of about
+  250,000 namespace property updates on JDBC failed with the INSERT's
+  `UncheckedSQLException`, 14 of them at 10 times the workload's rate.
+- **Fork:** fixed, `core-fixes` d4cc466: both statements run in one
+  transaction. When either finds the keys changed, the transaction rolls
+  back and the set tries again on a fresh read, up to five attempts,
+  then fails with `CommitFailedException`.
+- **In fileio-catalog:** nothing to work around. FileIOCatalog conditions
+  a property change on the namespace's version, so a race there is a
+  conflict.
+- **Canary:** `aJdbcPropertySetRacingAnotherWriterLandsWhole`: two
+  `JdbcCatalog`s on one SQLite database, the second inserting, then
+  removing, a key just before the first's write.
 
 ## Accepted Iceberg Behavior
 
