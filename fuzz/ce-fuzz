@@ -265,7 +265,7 @@ setup() {
     azure) tries $2/intentlog-fileio/src/test/java/org/intentlog/fileio/TestSegmentedCommitProtocol.java 1000000 ;;
     rebase)
       # shellcheck disable=SC2206
-      local r=(${REBASE_TRIES:-3000 3000 6000 3000 20000 20000 3000 3000 3000 3000})
+      local r=(${REBASE_TRIES:-3000 3000 6000 3000 20000 20000 3000 3000 3000 3000 3000 3000})
       [ ${#r[@]} = 1 ] && r=(each "${r[0]}")
       tries $2/$T/TestRebaseProperties.java "${r[@]}" ;;
     contract) tries $2/$T/ConflictEncodingContract.java each 2000 ;;

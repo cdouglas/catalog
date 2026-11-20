@@ -336,6 +336,11 @@ final class TableScript {
       this.stale = table;
     }
 
+    /** The catalog this runner commits through. */
+    Catalog catalog() {
+      return catalog;
+    }
+
     /**
      * Has the appends, overwrites and insert-only row deltas this runner runs add {@code a % 3 + 1}
      * files to their partition, not one, if {@code several}: manifests of several files, which a
@@ -682,14 +687,26 @@ final class TableScript {
         case DELETE_COLUMN:
           target.updateSchema().deleteColumn(addedColumn(target, cmd.b)).commit();
           break;
-        case UPDATE_COLUMN:
+        case UPDATE_COLUMN: {
+          String column = addedColumn(target, cmd.b);
+          Types.NestedField field = target.schema().findField(column);
+          // A schema update that changes nothing (a column already long, or optional) commits
+          // nothing alone. In a table transaction, though, Iceberg's retry commits it again on the
+          // table as it is, which fails it (an update made on the stale table: "refresh is
+          // required"), where the transaction's record carries nothing a catalog could judge it
+          // by: none can do as that retry does (the rebase oracle's R, gap plan 2.6), so a
+          // transaction leaves it out
+          if (inTransaction && (cmd.c % 2 == 0
+              ? field.type().equals(Types.LongType.get()) : field.isOptional())) {
+            throw new NotApplicable("a schema update that changes nothing");
+          }
           if (cmd.c % 2 == 0) {
-            target.updateSchema().updateColumn(addedColumn(target, cmd.b), Types.LongType.get())
-                .commit();
+            target.updateSchema().updateColumn(column, Types.LongType.get()).commit();
           } else {
-            target.updateSchema().makeColumnOptional(addedColumn(target, cmd.b)).commit();
+            target.updateSchema().makeColumnOptional(column).commit();
           }
           break;
+        }
         case RENAME_COLUMN:
           target.updateSchema().renameColumn(addedColumn(target, cmd.b), "r" + nextValue++)
               .commit();

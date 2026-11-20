@@ -97,6 +97,15 @@ import org.apache.iceberg.io.InMemoryAtomicFileIO.Fault;
  * table otherwise than R's writer: C1 (list-file snapshots stamp nothing)), and the guards all of
  * them read whatever a record checks.
  *
+ * <p>R may be a step of several commands (the review's C3, gap plan 2.6): a table transaction,
+ * whose record adds a snapshot per data commit in it, and whose reference is Iceberg's {@code
+ * BaseTransaction} retry, committing each of its updates again on the table as it is ({@link
+ * #anAdmittedTransactionIsWhatItsRetryWouldCommit}). And the window may hold a record that itself
+ * landed on a table changed since its writer read it: an inner racer, through a catalog of its
+ * own, commits just before the window's last step writes, so that step merges (or conflicts and
+ * is retried), and R is judged after it ({@link
+ * #aCommitAfterAMergedRecordIsWhatItsRetryWouldCommit}).
+ *
  * <p>{@link #anAdmittedReadSeesTheRowsItRead} is the oracle of serializable reads
  * (docs/CATALOG_TRANSACTIONS.md, "No false negatives"): R is a serializable catalog transaction
  * that scans a ref of the table under a row filter and writes another table, the same one, or
@@ -294,6 +303,54 @@ class TestRebaseProperties {
       @ForAll("twins") int twin) {
     check(twin, encoding, formatVersion, true, mode, true, merging, List.of(), sample.get(0),
         sample.get(1), sample.get(2).get(0));
+  }
+
+  /**
+   * C3's retry half (gap plan 2.6): R a table transaction of two to four commands, mostly data
+   * commits, each adding a snapshot, so its record adds several, racing data commits or any single
+   * command on an inline table. Iceberg's {@code BaseTransaction} retries a conflict by committing
+   * each of its updates again on the table as it is (a producer validating again, an update made
+   * on the stale table failing), the reference; a record the subject admits on a changed table
+   * must be what that retry commits.
+   */
+  @Property(tries = 300)
+  void anAdmittedTransactionIsWhatItsRetryWouldCommit(
+      @ForAll("encodings") String encoding,
+      @ForAll @IntRange(min = 2, max = 3) int formatVersion,
+      @ForAll boolean partitioned,
+      @ForAll("inlineModes") LocalCatalogMode mode,
+      @ForAll boolean pinned,
+      @ForAll("prefixes") List<TableScript.Cmd> prefix,
+      @ForAll("dataWindows") List<TableScript.Cmd> window,
+      @ForAll("transactions") List<TableScript.Cmd> r,
+      @ForAll boolean merging,
+      @ForAll("twins") int twin) {
+    check(twin, encoding, formatVersion, partitioned, mode, pinned, merging, List.of(), prefix,
+        window, r);
+  }
+
+  /**
+   * C3's other half (gap plan 2.6): R landing after a record that itself landed on a table changed
+   * since its writer read it. The window's last step is raced by an inner window of data commits,
+   * through a writer of its own, just before that step's first write: the step's record merges
+   * where the encoding merges it (or conflicts, and Iceberg retries it), and the encoding then
+   * judges R by what it observed of that record as applied. R: a validated commit, an append, or a
+   * table transaction.
+   */
+  @Property(tries = 300)
+  void aCommitAfterAMergedRecordIsWhatItsRetryWouldCommit(
+      @ForAll("guardedEncodings") String encoding,
+      @ForAll @IntRange(min = 2, max = 3) int formatVersion,
+      @ForAll boolean partitioned,
+      @ForAll("inlineManifestModes") LocalCatalogMode mode,
+      @ForAll("prefixes") List<TableScript.Cmd> prefix,
+      @ForAll("dataWindows") List<TableScript.Cmd> window,
+      @ForAll("innerWindows") List<TableScript.Cmd> inner,
+      @ForAll("dataSteps") List<TableScript.Cmd> r,
+      @ForAll boolean merging,
+      @ForAll("twins") int twin) {
+    check(twin, encoding, formatVersion, partitioned, mode, true, merging, List.of(), prefix,
+        window, inner, r);
   }
 
   /**
@@ -593,12 +650,53 @@ class TestRebaseProperties {
       List<TableScript.Cmd> prefix,
       List<TableScript.Cmd> window,
       TableScript.Cmd r) {
-    String[] outcome = verify(encoding, formatVersion, partitioned, mode, pinned, merging, writers,
-        prefix, window, r, TWINS[twin]);
+    check(twin, encoding, formatVersion, partitioned, mode, pinned, merging, writers, prefix,
+        window, List.of(r));
+  }
+
+  /** One try ({@code verify} with a {@code twin} drawn), R a step ({@link TableScript#steps}). */
+  private static void check(
+      int twin,
+      String encoding,
+      int formatVersion,
+      boolean partitioned,
+      LocalCatalogMode mode,
+      boolean pinned,
+      boolean merging,
+      List<LocalCatalogMode> writers,
+      List<TableScript.Cmd> prefix,
+      List<TableScript.Cmd> window,
+      List<TableScript.Cmd> r) {
+    check(twin, encoding, formatVersion, partitioned, mode, pinned, merging, writers, prefix,
+        window, List.of(), r);
+  }
+
+  /**
+   * One try ({@code verify} with a {@code twin} drawn), R a step, the window's last step raced by
+   * {@code inner}.
+   */
+  private static void check(
+      int twin,
+      String encoding,
+      int formatVersion,
+      boolean partitioned,
+      LocalCatalogMode mode,
+      boolean pinned,
+      boolean merging,
+      List<LocalCatalogMode> writers,
+      List<TableScript.Cmd> prefix,
+      List<TableScript.Cmd> window,
+      List<TableScript.Cmd> inner,
+      List<TableScript.Cmd> r) {
+    String[] outcome = verifyStep(encoding, formatVersion, partitioned, mode, pinned, merging,
+        writers, prefix, window, inner, r, TWINS[twin]);
     Statistics.label("R on a raced table")
         .collect(pinned ? encoding : encoding + ", unpinned", outcome[0]);
     if (outcome[3] != null) {
       Statistics.label("R's record unpaged and paged").collect(outcome[3]);
+    }
+    if (outcome[4] != null) {
+      Statistics.label("the window's last step").collect(outcome[4]);
     }
     Statistics.label("R").collect(outcome[1]);
     Statistics.label("manifests").collect(outcome[2]);
@@ -687,25 +785,75 @@ class TestRebaseProperties {
       List<TableScript.Cmd> window,
       TableScript.Cmd r,
       int[] twin) {
+    return verifyStep(encoding, formatVersion, partitioned, mode, pinned, merging, writers, prefix,
+        window, List.of(r), twin);
+  }
+
+  /**
+   * One try ({@code verify}), R a step: a command, or a table transaction and its members, which
+   * commit together ({@link TableScript#steps}); Iceberg's {@code BaseTransaction} retries a
+   * conflict by committing its updates again on the table as it is, the reference.
+   */
+  static String[] verifyStep(
+      String encoding,
+      int formatVersion,
+      boolean partitioned,
+      LocalCatalogMode mode,
+      boolean pinned,
+      boolean merging,
+      List<LocalCatalogMode> writers,
+      List<TableScript.Cmd> prefix,
+      List<TableScript.Cmd> window,
+      List<TableScript.Cmd> step,
+      int[] twin) {
+    return verifyStep(encoding, formatVersion, partitioned, mode, pinned, merging, writers, prefix,
+        window, List.of(), step, twin);
+  }
+
+  /**
+   * One try ({@code verifyStep}) whose window's last step is itself raced: {@code inner} commits,
+   * through a writer of its own in R's mode, just before that step's first write, so the step's
+   * record lands on a table changed since its writer read it (merged, where its encoding merges
+   * it, or retried), and R lands after a record applied on a table it did not read.
+   */
+  static String[] verifyStep(
+      String encoding,
+      int formatVersion,
+      boolean partitioned,
+      LocalCatalogMode mode,
+      boolean pinned,
+      boolean merging,
+      List<LocalCatalogMode> writers,
+      List<TableScript.Cmd> prefix,
+      List<TableScript.Cmd> window,
+      List<TableScript.Cmd> inner,
+      List<TableScript.Cmd> step,
+      int[] twin) {
+    if (TableScript.steps(step).size() != 1) {
+      throw new IllegalArgumentException("R is not one step: " + step);
+    }
+    TableScript.Cmd r = step.get(0);
     ClockSteps clock = new ClockSteps();
     CLOCK.set(clock);
     StringBuilder trace = new StringBuilder(String.format(
-        "v%d %s, %s, %s%s%s%s%nprefix %s%nwindow %s%s%nR %s%n", formatVersion,
+        "v%d %s, %s, %s%s%s%s%nprefix %s%nwindow %s%s%s%nR %s%n", formatVersion,
         partitioned ? "partitioned" : "unpartitioned", mode, encoding,
         pinned ? "" : ", R's writer leaves commit-once unpinned",
         merging ? ", merging manifests of several files" : "",
         twin == null ? ""
             : String.format(
                 ", unpaged, with a twin paged at block %d, window %d", twin[0], twin[1]),
-        prefix, window, writers.isEmpty() ? "" : " by " + writers, r));
+        prefix, window, writers.isEmpty() ? "" : " by " + writers,
+        inner.isEmpty() ? "" : ", its last step raced by " + inner,
+        step.size() == 1 ? r : step));
     Run subject = Run.of(encoding, mode, formatVersion, partitioned, pinned, merging, writers,
-        prefix, window, r, trace, twin == null ? Map.of() : paging(0, 0));
+        prefix, window, inner, step, trace, twin == null ? Map.of() : paging(0, 0));
     StringBuilder twinTrace = new StringBuilder();
     Run paged = twin == null ? null
         : Run.of(encoding, mode, formatVersion, partitioned, pinned, merging, writers, prefix,
-            window, r, twinTrace, paging(twin[0], twin[1]));
+            window, inner, step, twinTrace, paging(twin[0], twin[1]));
     Run retried = Run.of(LamportEncoding.NAME, mode, formatVersion, partitioned, true, merging,
-        writers, prefix, window, r, new StringBuilder(), Map.of());
+        writers, prefix, window, inner, step, new StringBuilder(), Map.of());
     // An expiry merged where it landed: the window, then what R chose on the prefix's table,
     // removed
     Run[] expiry = {null};
@@ -716,7 +864,7 @@ class TestRebaseProperties {
       }
       if (expiry[0] == null) {
         expiry[0] = Run.expiryReference(mode, formatVersion, partitioned, merging, writers, prefix,
-            window, r, trace);
+            window, inner, r, trace);
       }
       return expiry[0];
     };
@@ -754,7 +902,7 @@ class TestRebaseProperties {
         !merging ? "not merging"
             : subject.keptOlderFiles ? "merging, R wrote a manifest of older files"
                 : "merging, R wrote no manifest of older files",
-        admission};
+        admission, subject.lastStep};
   }
 
   /**
@@ -1286,6 +1434,43 @@ class TestRebaseProperties {
     return TableScript.commands(TestRebaseProperties::single).withoutEdgeCases();
   }
 
+  /** One or two data commits (appends, validated commits): an inner window. */
+  @Provide
+  Arbitrary<List<TableScript.Cmd>> innerWindows() {
+    return TableScript.commands(kind -> VALIDATED.contains(kind) || APPEND_LIKE.contains(kind))
+        .withoutEdgeCases()
+        .list().ofMinSize(1).ofMaxSize(2);
+  }
+
+  /** R as a step: a validated commit or an append, or a table transaction (a third each). */
+  @Provide
+  Arbitrary<List<TableScript.Cmd>> dataSteps() {
+    return Arbitraries.oneOf(validated().map(List::of), appendLike().map(List::of),
+        transactions());
+  }
+
+  /**
+   * Table transactions of two to four single commands, two thirds of them data commits (appends,
+   * validated commits): a TRANSACTION command and its members, one step ({@link
+   * TableScript#steps}).
+   */
+  @Provide
+  Arbitrary<List<TableScript.Cmd>> transactions() {
+    Arbitrary<TableScript.Cmd> member = Arbitraries.frequencyOf(
+        Tuple.of(2, TableScript.commands(
+            kind -> VALIDATED.contains(kind) || APPEND_LIKE.contains(kind))),
+        Tuple.of(1, TableScript.commands(TestRebaseProperties::single)));
+    return Combinators.combine(member.list().ofMinSize(2).ofMaxSize(4),
+            Arbitraries.integers().between(0, 11))
+        .as((members, b) -> {
+          List<TableScript.Cmd> step = new ArrayList<>();
+          step.add(new TableScript.Cmd(TableScript.Kind.TRANSACTION, members.size() - 2, b, 0));
+          step.addAll(members);
+          return step;
+        })
+        .withoutEdgeCases();
+  }
+
   /** Whether a serializable transaction's catalog holds its reads by read witness: mostly. */
   @Provide
   Arbitrary<Boolean> readWitnesses() {
@@ -1486,6 +1671,8 @@ class TestRebaseProperties {
     final Map<String, String> view;
     // whether a snapshot R added wrote a manifest that keeps files of earlier commits
     final boolean keptOlderFiles;
+    // how the window's last step went, if an inner racer raced it (Run.of), else null
+    String lastStep;
 
     private Run(InMemoryAtomicFileIO io, RuntimeException failure, boolean raced,
         boolean changed, long conflicts, Map<String, Long> reasons, Map<String, String> view,
@@ -1502,8 +1689,8 @@ class TestRebaseProperties {
 
     static Run of(String encoding, LocalCatalogMode mode, int formatVersion, boolean partitioned,
         boolean pinned, boolean merging, List<LocalCatalogMode> writers,
-        List<TableScript.Cmd> prefix, List<TableScript.Cmd> window, TableScript.Cmd r,
-        StringBuilder trace, Map<String, String> paging) {
+        List<TableScript.Cmd> prefix, List<TableScript.Cmd> window, List<TableScript.Cmd> inner,
+        List<TableScript.Cmd> r, StringBuilder trace, Map<String, String> paging) {
       InMemoryAtomicFileIO io = new InMemoryAtomicFileIO();
       Map<String, String> properties = properties(merging);
       properties.put(LogCatalogProperties.CONFLICT_ENCODING, encoding);
@@ -1521,20 +1708,59 @@ class TestRebaseProperties {
       }
       List<List<TableScript.Cmd>> steps = TableScript.steps(window);
       List<TableScript.Runner> racers = racers(io, mode, writers, steps.size(), merging, trace);
+      // the inner racer: a catalog of its own, so its commit runs inside another writer's
+      TableScript.Runner innerRacer = inner.isEmpty() ? null
+          : new TableScript.Runner(mode.catalog(io, WAREHOUSE, "c", PROPERTIES), "wi", trace)
+              .severalFiles(merging);
+      boolean[] innerArmed = {false};
+      String[] innerChanged = {null}; // the version before and after the inner racer's steps
       boolean[] raced = {false};
       String[] before = {null};
       String[] after = {null};
+      String[] lastStep = {null}; // how the window's last step went, if an inner racer raced it
       // the table just before R's write: its snapshots, which R's commit leaves as they are, and
       // its next row id, from which R's commit gives ids (TableViews.logical)
       TableMetadata[] beforeR = {current(io)};
+      // with an inner racer, the table just after its steps: the window's last step lands there,
+      // on a table changed since its writer read it, and gives ids as R does (a retry's merged
+      // manifests give its new rows other ids), so the view compares from there
+      TableMetadata[] beforeMerged = {null};
       List<String> results = new ArrayList<>();
       io.injectFaults((location, strategy) -> {
-        if (!raced[0] && location.equals(CATALOG)) {
+        if (innerArmed[0] && location.equals(CATALOG)) {
+          innerArmed[0] = false;
+          trace.append("inner window, just before the last step's first write:\n");
+          innerChanged[0] = version(io);
+          for (List<TableScript.Cmd> step : TableScript.steps(inner)) {
+            results.add("inner " + (innerRacer.run(step) == null ? "ok" : "rejected"));
+            lookAtClock();
+          }
+          innerChanged[0] = innerChanged[0].equals(version(io)) ? "unchanged" : "changed";
+          beforeMerged[0] = current(io);
+          trace.append("the window's last step goes on:\n");
+        } else if (!raced[0] && location.equals(CATALOG)) {
           raced[0] = true;
           trace.append("window, just before R's first write:\n");
           before[0] = version(io);
           for (int i = 0; i < steps.size(); i++) {
-            results.add(racers.get(i).run(steps.get(i)) == null ? "ok" : "rejected");
+            innerArmed[0] = innerRacer != null && i == steps.size() - 1;
+            org.apache.iceberg.catalog.Catalog racing = racers.get(i).catalog();
+            long conflicted = racing instanceof LogCatalog logCatalog
+                ? logCatalog.log().counts().conflicts() : 0;
+            RuntimeException failed = racers.get(i).run(steps.get(i));
+            results.add(failed == null ? "ok" : "rejected");
+            if (innerArmed[0]) {
+              lastStep[0] = "the inner racer did not run (the last step wrote nothing)";
+            } else if (innerRacer != null && i == steps.size() - 1) {
+              conflicted = racing instanceof LogCatalog logCatalog
+                  ? logCatalog.log().counts().conflicts() - conflicted : 0;
+              lastStep[0] = "unchanged".equals(innerChanged[0])
+                  ? "the inner racer left the table as it was"
+                  : failed != null ? "the last step failed"
+                      : conflicted > 0 ? "the last step conflicted, then committed"
+                          : "the last step merged";
+            }
+            innerArmed[0] = false;
             lookAtClock();
           }
           after[0] = version(io);
@@ -1547,7 +1773,7 @@ class TestRebaseProperties {
       RuntimeException failure;
       try {
         trace.append("R:\n");
-        failure = writer.run(List.of(r));
+        failure = writer.run(r);
         lookAtClock();
       } finally {
         io.injectFaults((location, strategy) -> Fault.NONE);
@@ -1562,11 +1788,15 @@ class TestRebaseProperties {
       });
       trace.append(String.format("R %s after %d conflicts %s; window %s%n",
           failure == null ? "committed" : "failed", conflicts, reasons, results));
-      return new Run(io, failure, raced[0], raced[0] && !before[0].equals(after[0]), conflicts,
+      TableMetadata compared = beforeMerged[0] != null ? beforeMerged[0] : beforeR[0];
+      Run run = new Run(io, failure, raced[0], raced[0] && !before[0].equals(after[0]), conflicts,
           reasons,
           TableViews.logical(reader(io).loadTable(TableScript.ID),
-              beforeR[0].snapshots().size(), beforeR[0].nextRowId()),
+              compared.snapshots().size(), compared.nextRowId()),
           keptOlderFiles(io, beforeR[0]));
+      run.lastStep = innerRacer == null ? null
+          : lastStep[0] != null ? lastStep[0] : "R wrote nothing, so no window ran";
+      return run;
     }
 
     /** The conflicts {@code catalog} counted by reason, numbers masked. */
@@ -1645,7 +1875,8 @@ class TestRebaseProperties {
      */
     static Run expiryReference(LocalCatalogMode mode, int formatVersion, boolean partitioned,
         boolean merging, List<LocalCatalogMode> writers, List<TableScript.Cmd> prefix,
-        List<TableScript.Cmd> window, TableScript.Cmd r, StringBuilder trace) {
+        List<TableScript.Cmd> window, List<TableScript.Cmd> inner, TableScript.Cmd r,
+        StringBuilder trace) {
       // What R chooses on the prefix's table
       InMemoryAtomicFileIO scratch = new InMemoryAtomicFileIO();
       LogCatalog chooser = mode.catalog(scratch, WAREHOUSE, "c", properties(merging));
@@ -1674,6 +1905,15 @@ class TestRebaseProperties {
       List<TableScript.Runner> racers =
           racers(io, mode, writers, steps.size(), merging, new StringBuilder());
       for (int i = 0; i < steps.size(); i++) {
+        if (i == steps.size() - 1 && !inner.isEmpty()) { // the inner racer's commit landed first
+          TableScript.Runner innerRacer = new TableScript.Runner(
+              mode.catalog(io, WAREHOUSE, "c", PROPERTIES), "wi", new StringBuilder())
+              .severalFiles(merging);
+          for (List<TableScript.Cmd> step : TableScript.steps(inner)) {
+            innerRacer.run(step);
+            lookAtClock();
+          }
+        }
         racers.get(i).run(steps.get(i));
         lookAtClock();
       }
