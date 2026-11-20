@@ -177,6 +177,19 @@ Not_ResolveAfterGc ==
   \A w \in Writers :
     ~(ws[w].pc = "resolve" /\ ws[w].txn.id \in IdsOf(Hist) /\ ws[w].txn.id \notin LiveR.C)
 Not_Exhausted == \A w \in Writers : ~(ws[w].pc = "loop" /\ ws[w].att >= MaxAttempts)
+\* F4's outcome properties are not vacuous: a commit judged applied that went on
+\* to compact (CommitStands), one that failed with another transaction applied
+\* since its snapshot (FailedExplained), and a fault past a commit's own
+\* requests (pf), which no outcome property excuses.
+\* F1: a record's copy in the log below the floor, its id applied (the probe
+\* path's resend after a replace paged its id; only the floor rejects it).
+Not_CopyBelowFloor ==
+  \A i \in 1..Len(file.log) :
+    IsTxn(file.log[i]) => ~(file.log[i].id \in IdsOf(file.chk.st.hist)
+                             /\ file.log[i].id.ts <= file.chk.F)
+Not_Judged == \A e \in ended : ~e.judged
+Not_FailedRaced == \A e \in ended : ~(e.out = "failed" /\ e.rc)
+Not_PastFaultOnly == \A e \in ended : ~(e.pf /\ ~e.cf)
 
 \* Compaction after the commit (CompactAfter): one landed (its incarnation's
 \* third part is 0); one lost its race (the object changed since the

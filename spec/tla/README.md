@@ -172,8 +172,12 @@ goes in a replace, `oversized` in `mustReplace`: Bug 71, covered by
 | `WellNamed` | design.md I13: no namespace holds two tables or views of one name, or any once it is dropped |
 | `HonestCommitted` | a commit reported committed applied, and stays applied, through compaction and GC |
 | `HonestFailed` | a commit reported failed, or any error but unknown, is not applied, now or later (a late landing included) |
-| `UnknownExplained` | an unknown outcome follows a fault, or a read that put the id at or below the horizon |
-| `SoloCommits` | a commit no other write raced, on storage that did not fail, commits |
+| `UnknownExplained` | an unknown outcome follows a fault in one of the commit's own requests (its writes and reads; not a page put before its CAS, nor its compaction's write or read, ghost `pf`), or a read that put the id at or below the horizon |
+| `SoloCommits` | a commit no other write raced, on storage that did not fail its own requests, commits |
+| `CommitStands` | a commit whose record a read found applied is reported committed, whatever becomes of its compaction (LOG.md "the commit stands") |
+| `FailedExplained` | a commit reported failed has a cause: another transaction applied since the snapshot it staged on, its id crossed the horizon or the floor, it ran out of attempts, or a fault hit its own requests |
+| `RetentionHonoured` | the horizon stays a retention behind the latest writer's clock: GC drops no id younger than the retention |
+| `FloorHonoured` | the floor stays at the horizon or an admission window behind the latest writer's clock |
 | `StampsCount` | S3: each entity's version counts the records that changed it, so it only grows |
 | `HistGrows` (action) | the history only grows, one transaction at a time |
 | `CasAppliesItsRecord` (action) | a CAS applies its own record when the record holds on the checkpoint it wrote |
@@ -181,8 +185,8 @@ goes in a replace, `oversized` in `mustReplace`: Bug 71, covered by
 
 ## Results
 
-Every configuration of the correct protocol passes. `check.py` holds 181
-configurations (109 of the file model, 52 `log-*`, 20 `sg-*`), 112 of them
+Every configuration of the correct protocol passes. `check.py` holds 194
+configurations (122 of the file model, 52 `log-*`, 20 `sg-*`), 122 of them
 expected to pass; the rest are bug switches, each expected to break a
 property. The state counts in this file's tables are from `check.py`'s full
 run at 4c685a3 (2026-11-11: the 138 configurations it held then, about six
@@ -236,6 +240,7 @@ one would after an encoding admitted the record on a later version.
 | 26 | the CAS after a lost append reads the version `current` was bound to | `UnknownExplained` |
 | 64a | replay asks `containsTransaction`, which throws at the horizon | `Readable` |
 | 64b | the CAS watermark is not capped below its own record | `CasAppliesItsRecord` |
+| `noretention` | not a bug found: the GC watermark computed without the retention, up to the writer's clock (its outcomes are unknown or failed with the id crossed, which `UnknownExplained` accepts: F4) | `RetentionHonoured` |
 | 64c | ids are minted without regard to the horizon | `CasAppliesItsRecord` |
 | 64d | `DedupHorizonExceededException` escapes the commit | `HonestFailed` |
 | 66 | `SegmentLimitException` is taken as ambiguous | `UnknownExplained` |
@@ -254,7 +259,10 @@ reaches the branch:
 - preemption on each fuzzer's schedules, two racers, restages, A failing its race;
 - a timed-out write that can land after its commit reported;
 - a writer's clock behind the horizon;
-- a writer resolving a lost reply after GC dropped its id.
+- a writer resolving a lost reply after GC dropped its id;
+- a commit judged applied that went on to compact, a commit failed with another transaction
+  applied since its snapshot, a fault past a commit's own requests (a page put), and a horizon
+  at a retention of two ticks (F4's properties are not vacuous).
 
 **Interleavings the fuzzers do not produce.** No counterexample was found in any of
 these, so no new `TestCatalogRegressions` test:
@@ -1005,7 +1013,8 @@ Its switches:
 |---|---|---|
 | `compactbase` | a compaction that checkpoints the replica the commit staged or rebased on, before its record, conditioned on the version its record landed in | `HonestCommitted` |
 | `compactresend` | a compaction that lost its race sent again on the object as it now is, as if the records that beat it were in its checkpoint | `HistGrows` |
-| `compactfail` | a compaction that lost its race fails the commit | `HonestFailed` |
+| `compactfail` | a compaction that lost its race fails the commit | `HonestFailed` (and `CommitStands`, `FailedExplained`) |
+| `compactunknown` | a compaction whose write was ambiguous reports the commit unknown: every property passed it while a compaction's fault counted as the commit's (the 2026-11-17 review's F4) | `UnknownExplained`, `CommitStands` |
 | `compactcopyafter` | a resend with the records that beat it after its GC record and PageOuts, where a GC at retention 0 drops their ids | `CheckpointIsReplay` (the matrix: `HonestCommitted`) |
 | `compactreplaced` | a resend that takes a replace as long as the version it lost on for growth | `HonestCommitted` |
 

@@ -51,7 +51,8 @@ BASE = {
 
 SAFETY = ["Readable", "NoUnheldState", "ExactlyOnce", "Serializable", "UniqueIds", "WellNamed",
           "HonestCommitted", "HonestFailed", "UnknownExplained", "SoloCommits", "StampsCount",
-          "PagesExist", "PagesExact", "Shape", "OnGrid", "StatePagesExist"]
+          "PagesExist", "PagesExact", "Shape", "OnGrid", "StatePagesExist", "CommitStands",
+          "FailedExplained", "RetentionHonoured", "FloorHonoured"]
 ACTIONS = ["HistGrows", "CasAppliesItsRecord", "CheckpointIsReplay"]
 
 ALL_FAULTS = ('{"failBefore", "lostReply", "landedConflict", "throttled", '
@@ -90,6 +91,10 @@ CONFIGS = {
     "faults": ({"MaxFaults": "1", "FaultKinds": ALL_FAULTS}, "pass"),
     "faults-strict": ({"MaxFaults": "1", "FaultKinds": ALL_FAULTS, "Strict": "TRUE"}, "pass"),
     "gc0": ({"Retention": "0", "MaxTime": "2", "Shapes": "<- TwoEach", "MaxCount": "1"}, "pass"),
+    # A retention of two ticks, and its switch: a watermark computed without it (F4).
+    "gc2": ({"Retention": "2", "MaxTime": "3", "Shapes": "<- TwoEach", "MaxCount": "1"}, "pass"),
+    "noretention": ({"Retention": "2", "MaxTime": "3", "Shapes": "<- TwoEach", "MaxCount": "1",
+                     "Bugs": '{"noretention"}'}, {"RetentionHonoured"}),
     "seg": ({"SegLimit": "2", "MaxCount": "10"}, "pass"),
     # Everything at once, at small bounds.
     "mix": ({"Shapes": "<- TwoEach", "MaxCount": "1", "MaxSize": "4", "SegLimit": "3",
@@ -133,6 +138,18 @@ CONFIGS = {
     # A CAS pages the ids in (clock - R, min(clock - A, own stamp - 1)] (it pages the view after
     # its own GC), so with A = 0 it pages nothing below R = 2.
     "page-gc": ({**FPAGE, "Retention": "2", "MaxTime": "3"}, "pass"),
+    # The 2026-11-17 review's F1 and F9: paging on the probe path (tail reads off), where a
+    # resend after a replace paged its id lands a copy only the floor rejects; two ids a block;
+    # an admission window; three writers.
+    "page-probe": ({**FPAGE, "TailReads": "FALSE", "MaxFaults": "1",
+                    "FaultKinds": FPAGE_FAULTS}, "pass"),
+    "page-n2": ({**FPAGE, "BlockIds": "2", "MaxTime": "2"}, "pass"),
+    "page-admit": ({**FPAGE, "Admission": "1", "MaxTime": "3"}, "pass"),
+    "page-three": ({**FPAGE, "Writers": "{1, 2, 3}", "Shapes": "<- Three",
+                    "Skew": "<- NoSkew3"}, "pass"),
+    # F8: liveness, every writer finishes (FairSpec: writers keep stepping, faults run out).
+    "base-live": ({"_spec": "FairSpec", "_props": "Termination"}, "pass"),
+    "page-live": ({**FPAGE, "_spec": "FairSpec", "_props": "Termination"}, "pass"),
     "page-faults": ({**FPAGE, "MaxFaults": "1", "FaultKinds": FPAGE_FAULTS, "Strict": "TRUE"},
                     "pass"),
     "page-skew": ({**FPAGE, "Skew": "<- Behind2"}, "pass"),
@@ -256,6 +273,14 @@ CONFIGS = {
     "after-resend-gc": ({**AFTER, "Shapes": "<- TwoEach", "CompactResends": "2", "Retention": "0",
                          "MaxTime": "2", "Skew": "<- Behind2"}, "pass"),
     "after-resend-page": ({**FPAGE, **AFTER, "CompactResends": "2", "Skew": "<- Behind2"}, "pass"),
+    # F1, F8, F9 after the commit: the probe path with paging; liveness; resends with paging
+    # and GC at once.
+    "after-page-probe": ({**FPAGE, **AFTER, "TailReads": "FALSE", "MaxFaults": "1",
+                          "FaultKinds": FPAGE_FAULTS}, "pass"),
+    "after-two-each-live": ({**AFTER, "Shapes": "<- TwoEach", "_spec": "FairSpec",
+                             "_props": "Termination"}, "pass"),
+    "after-resend-page-gc": ({**FPAGE, **AFTER, "CompactResends": "2", "Retention": "2",
+                              "MaxTime": "3", "Skew": "<- Behind2"}, "pass"),
     # Its switches: a compaction that checkpoints the replica the commit staged on, before its
     # record; one that is resent on the object as it is after losing its race (as if the records
     # that beat it were in its checkpoint); one whose loss fails the commit.
@@ -264,7 +289,12 @@ CONFIGS = {
     "compactresend": ({**AFTER, "Shapes": "<- TwoEach", "Bugs": '{"compactresend"}'},
                       {"CheckpointIsReplay", "HistGrows", "HonestCommitted"}),
     "compactfail": ({**AFTER, "Shapes": "<- TwoEach", "Bugs": '{"compactfail"}'},
-                    {"HonestFailed"}),
+                    {"HonestFailed", "CommitStands", "FailedExplained"}),
+    # One whose ambiguous write reports the commit unknown: no property caught it while a
+    # compaction's fault counted as the commit's own (the 2026-11-17 review's F4).
+    "compactunknown": ({**AFTER, "Shapes": "<- TwoEach", "MaxFaults": "1",
+                        "FaultKinds": ALL_FAULTS, "Bugs": '{"compactunknown"}'},
+                       {"CommitStands", "UnknownExplained"}),
     # A resend whose copied records follow its GC record and PageOuts (judged on a view that
     # dropped or paged ids they were judged without); one that takes a replace as long as the
     # version it lost on for growth.
@@ -273,6 +303,11 @@ CONFIGS = {
                          {"CheckpointIsReplay", "HistGrows", "HonestCommitted"}),
     "compactreplaced": ({**AFTER, "Shapes": "<- TwoEach", "Bugs": '{"compactreplaced"}'},
                         {"CheckpointIsReplay", "HistGrows", "HonestCommitted"}),
+    # compactcopyafter with PageOuts in place of the GC record (F9).
+    "compactcopyafter-page": ({**FPAGE, **AFTER, "CompactResends": "2", "Skew": "<- Behind2",
+                               "Bugs": '{"compactcopyafter"}'},
+                              {"CheckpointIsReplay", "HistGrows", "HonestCommitted",
+                               "PagesExact"}),
     # A resend's PageOuts were computed before the records it copies: one whose block they changed
     # must be refused (the digest check), which on one object only a resend needs.
     "after-nodigest": ({**FPAGE, **AFTER, "CompactResends": "2", "Skew": "<- Behind2",
@@ -552,6 +587,8 @@ WITNESSES = [
     ("faults", "Not_Unknown"),
     ("faults", "Not_CommittedAfterFault"), ("two-each", "Not_Overshoot"),
     ("faults2", "Not_Exhausted"),
+    ("after-two-each", "Not_Judged"), ("base", "Not_FailedRaced"),
+    ("page-faults", "Not_PastFaultOnly"), ("gc2", "Not_Horizon"),
     ("sched-mw", "Not_Preempted"), ("sched-fault", "Not_Preempted"),
     ("sched-race", "Not_TwoRacers"), ("sched-race", "Not_RaceFailedA"),
     ("sched-race-op", "Not_Restaged"), ("sched-fault", "Not_Restaged"),
@@ -575,6 +612,8 @@ WITNESSES = [
     ("page", "Not_Floor"), ("page", "Not_PageOutInLog"), ("page-faults", "Not_PagedOwnId"),
     ("page-faults", "Not_Orphan"), ("page-gc", "Not_Swept"), ("page-cas", "Not_TwoPages"),
     ("page-gc", "Not_PageBelowHorizon"), ("page-skew", "Not_Floor"),
+    ("page-probe", "Not_CopyBelowFloor"), ("page-admit", "Not_Floor"),
+    ("after-page-probe", "Not_CopyBelowFloor"),
     ("log-page", "Not_Floor"), ("log-page", "Not_PageOutRefused"), ("log-page", "Not_Orphan"),
     ("log-page-gc", "Not_Swept"), ("log-page2", "Not_Swept"), ("log-page", "Not_PagedOwnId"),
     ("log-page", "Not_FailedBelowFloor"),
@@ -643,6 +682,8 @@ BUG_KNOBS = {
     "compactbase": {**AFTER},
     "compactresend": {**AFTER},
     "compactfail": {**AFTER},
+    "compactunknown": {**AFTER, **F1},
+    "noretention": {"Retention": "2", "MaxTime": "3", "MaxCount": "1"},
     "compactcopyafter": {**AFTER, **GC, "skew": True},
     "compactreplaced": {**AFTER},
 }
@@ -703,12 +744,14 @@ def cfg_text(overrides, invariants=None, properties=None, model="MC"):
     base, safety, actions = MODELS[model]
     consts = dict(base)
     consts.update(overrides)
-    lines = ["SPECIFICATION Spec", "CONSTANTS", "  None = None"]
+    spec = consts.pop("_spec", "Spec")
+    extra = [p for p in consts.pop("_props", "").split(",") if p]
+    lines = ["SPECIFICATION " + spec, "CONSTANTS", "  None = None"]
     for k, v in consts.items():
         lines.append(f"  {k} {v}" if v.startswith("<-") else f"  {k} = {v}")
     lines.append("INVARIANTS")
     lines += [f"  {p}" for p in (safety if invariants is None else invariants)]
-    props = actions if properties is None else properties
+    props = (actions if properties is None else properties) + extra
     if props:
         lines.append("PROPERTIES")
         lines += [f"  {p}" for p in props]

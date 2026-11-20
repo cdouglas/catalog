@@ -92,7 +92,8 @@ ASSUME /\ FaultKinds \subseteq WriteFaults \cup ReadFaults \cup PutFaults
                           "pageown", "rootfirst", "sweepstale",
                           "lengthonly", "notrailer", "probeinc",
                           "compactbase", "compactresend", "compactfail",
-                          "compactcopyafter", "compactreplaced",
+                          "compactcopyafter", "compactreplaced", "compactunknown",
+                          "noretention",
                           "viewnotable", "tablenoview", "viewdropnoremovals", "viewnobump", "viewstale",
                           "absentonly", "noabsence", "dropnobump", "renamenobump"}
        /\ TailReads \in BOOLEAN
@@ -105,7 +106,7 @@ VARIABLES
   now,       \* the clock
   nf,        \* faults injected so far
   ws,        \* Writers -> the writer's commit (see Idle)
-  ended,     \* the outcomes reported, per commit: [id, out, cf, cx, ci]
+  ended,     \* the outcomes reported, per commit: [id, out, cf, cx, ci, pf, judged, rc, ex, bf]
   res,       \* Writers -> the outcome of the writer's last operation, or None
   ook,       \* every oracle check so far passed (CatalogOracles)
   sched,     \* [active, nest: the operations running; pre: how many ran inside the
@@ -202,7 +203,8 @@ PageOuts(a, ceil) ==
 \* is off), with Paging its PageOuts, then the record.
 \* The checkpoint is the replay of the version the CAS replaces, whatever the
 \* clock says (I11). With Bug 64b the watermark is not capped below the
-\* record's own time. With "ckgc" the checkpoint itself is filtered at the
+\* record's own time; with "noretention", computed without the retention, up
+\* to the writer's clock. With "ckgc" the checkpoint itself is filtered at the
 \* watermark, as it was before GC records: a reader starting from another
 \* checkpoint of the same log would not see the same horizon.
 \* The PageOuts page the view after the CAS's own GC, up to a ceiling: the
@@ -210,7 +212,8 @@ PageOuts(a, ceil) ==
 \* stamp, as its GC record is (with "pageown", not below it).
 CasPayload(w, b, t) ==
   LET c    == Clock(w)
-      wm0  == IF Retention < 0 \/ Retention >= c THEN 0 ELSE c - Retention
+      wm0  == IF Retention < 0 THEN 0 ELSE IF Has("noretention") THEN c
+              ELSE IF Retention >= c THEN 0 ELSE c - Retention
       wm   == IF Has("64b") THEN wm0 ELSE Max(0, Min(wm0, t.id.ts - 1))
       ceil == IF Has("pageown") THEN c - Admission ELSE Min(c - Admission, t.id.ts - 1)
       pos  == IF Paging THEN PageOuts(Gc(b, wm), ceil) ELSE << >>
@@ -229,7 +232,8 @@ CasPayload(w, b, t) ==
 CompactPayload(w, s) ==
   LET R    == IF Has("compactbase") THEN s.base ELSE s.lr
       c    == Clock(w)
-      wm   == IF Retention < 0 \/ Retention >= c THEN 0 ELSE c - Retention
+      wm   == IF Retention < 0 THEN 0 ELSE IF Has("noretention") THEN c - 1
+              ELSE IF Retention >= c THEN 0 ELSE c - Retention
       pos  == IF Paging THEN PageOuts(Gc(R, wm), c - Admission) ELSE << >>
   IN [chk |-> Ck(R), log |-> (IF wm = 0 THEN << >> ELSE << [wm |-> wm] >>) \o pos]
 
@@ -262,6 +266,7 @@ Idle(k, n) ==
    cur |-> None, stale |-> FALSE, amb |-> FALSE, unres |-> FALSE, full |-> FALSE,
    att |-> 0, thr |-> 0, pend |-> None, written |-> None, rt |-> 0, nw |-> 0, pay |-> None,
    cf |-> FALSE, cx |-> FALSE, ci |-> FALSE, cw |-> << >>, first |-> None, ocf |-> FALSE,
+   pf |-> FALSE, ex |-> FALSE, bf |-> FALSE,
    lr |-> None, cre |-> FALSE, cv |-> None, cp |-> << >>, crs |-> 0, cc |-> << >>]
 \* pc: idle, staged, loop, cas, throttled, readback, rebase, refresh, shrink,
 \*   resolve, restage, compact, compactread.
@@ -280,11 +285,14 @@ Idle(k, n) ==
 \* amb: a write's outcome was unknown (ambiguous); unres: a write failed its
 \*   precondition and no read has ruled out that it landed (unresolved);
 \*   full: storage refused an append past its cap (full).
-\* Ghosts: cf, a fault was injected into this commit; cx, a read of it had
-\*   its id at or below the horizon; ci, another write landed since its
-\*   snapshot; cw, its writes that landed, [before, after]; first, the
-\*   catalog before the operation's first write; ocf, a fault was injected
-\*   into the operation.
+\* Ghosts: cf, a fault was injected into one of this commit's own requests
+\*   (its writes and reads); pf, into a request it makes past them (a page
+\*   put before a CAS, its compaction's write and read), which cannot change
+\*   its outcome; cx, a read of it had its id at or below the horizon; ci,
+\*   another write landed since its snapshot; cw, its writes that landed,
+\*   [before, after]; first, the catalog before the operation's first write;
+\*   ocf, a fault was injected into the operation; ex, it ran out of
+\*   attempts; bf, its id was below the floor (BEYOND_FLOOR).
 
 \* The other writers in a commit see the catalog change under them.
 Upd(w, s2, landed) ==
@@ -307,6 +315,9 @@ Crossed(R, t) == R.H > 0 /\ t.id.ts <= R.H
 
 \* s after a request fk: a fault, if fk is one.
 Faulted(s, fk) == [s EXCEPT !.cf = @ \/ fk # "none", !.ocf = @ \/ fk # "none"]
+
+\* s after a request fk past the commit's own (a page put, a compaction).
+PFaulted(s, fk) == [s EXCEPT !.pf = @ \/ fk # "none", !.ocf = @ \/ fk # "none"]
 
 \* A write of this commit may have landed (earlier(ambiguous, unresolved)).
 Earlier(s) == s.amb \/ s.unres
@@ -332,7 +343,9 @@ End(w, s, out, landed) ==
                                           !.first = s.first, !.ocf = s.ocf]
   IN
   /\ ended' = ended \cup {[id |-> s.txn.id, out |-> out, cf |-> s.cf, cx |-> s.cx,
-                           ci |-> s.ci]}
+                           ci |-> s.ci, pf |-> s.pf, judged |-> s.lr # None,
+                           rc |-> s.snap # None /\ Len(LiveR.st.hist) > Len(s.snap.st.hist),
+                           ex |-> s.ex, bf |-> s.bf]}
   /\ ws' = Upd(w, IF final THEN Idle(s.k + 1, s.n + 1) ELSE again, landed)
   /\ res' = IF final THEN [res EXCEPT ![w] = out] ELSE res
   /\ ook' = (ook /\ OracleAtEnd(w, s, out, final))
@@ -386,7 +399,7 @@ Judge(w, s, R, pf, rb, then) ==
   CASE c = "yes" -> Committed(w, s, R)
     [] c = "unknown" -> End(w, s, IF Has("64d") THEN "error"
                                  ELSE IF Earlier(s) THEN "unknown" ELSE "failed", FALSE)
-    [] c = "absent" -> End(w, s, "failed", FALSE)
+    [] c = "absent" -> End(w, [s EXCEPT !.bf = TRUE], "failed", FALSE)
     [] c = "fail" -> IF rb THEN Ambig(w, s, FALSE) ELSE Unreadable(w, s)
     [] c = "missing" -> FALSE
     [] OTHER -> then
@@ -680,7 +693,7 @@ Exhaust(w) ==
   /\ s.amb \/ ~s.unres
   /\ UNCHANGED <<file, inflight, now, nf>>
   /\ UNCHANGED PageVars
-  /\ End(w, s, IF s.amb THEN "unknown" ELSE "failed", FALSE)
+  /\ End(w, [s EXCEPT !.ex = TRUE], IF s.amb THEN "unknown" ELSE "failed", FALSE)
 
 FinalRead(w, fk) ==
   LET s == ws[w]
@@ -688,7 +701,8 @@ FinalRead(w, fk) ==
   IN /\ s.pc = "loop" /\ s.att >= MaxAttempts /\ ~s.amb /\ s.unres
      /\ ReadLive(w, fk, s, {"loop"})
      /\ IF fk = "readFail" \/ LiveR.err THEN Unreadable(w, Faulted(s, fk))
-        ELSE Judge(w, s1, LiveOf(s), fk = "pageFail", FALSE, End(w, s1, "failed", FALSE))
+        ELSE Judge(w, s1, LiveOf(s), fk = "pageFail", FALSE,
+                   End(w, [s1 EXCEPT !.ex = TRUE], "failed", FALSE))
 
 \* With CompactAfter, the compaction of the replica the commit's record
 \* landed in: one conditional replace of that version (with Paging, its pages
@@ -701,8 +715,10 @@ FinalRead(w, fk) ==
 \* With "compactresend", a compaction that lost its race is sent again,
 \* once, on the version the object is now, as if the records that beat it
 \* were in its checkpoint. With "compactfail", one that lost reports the
-\* commit failed. A compaction is not one of the commit's writes (cw, nw),
-\* and no racer runs before it (Sched "race").
+\* commit failed; with "compactunknown", one whose write was ambiguous
+\* reports it unknown. A compaction is not one of the commit's writes (cw,
+\* nw), its faults are not the commit's (pf), and no racer runs before it
+\* (Sched "race").
 CompactCond(s) ==
   IF s.cv = None THEN [gen |-> s.lr.gen, len |-> s.lr.len, inc |-> s.lr.inc] ELSE s.cv
 Compact(w, fk) ==
@@ -716,7 +732,7 @@ Compact(w, fk) ==
       ok == file.gen = x.cond
       lands == ok /\ fk \in {"none", "lostReply", "landedConflict", "landedThrottled"}
       lost == fk = "none" /\ ~ok
-      s1 == [Faulted(s, fk) EXCEPT !.pay = None,
+      s1 == [PFaulted(s, fk) EXCEPT !.pay = None,
                !.cc = IF lands THEN Append(@, [before |-> file, after |-> Land(file, x)]) ELSE @]
   IN /\ CanStep(w) /\ s.pc = "compact" /\ (~Paging \/ s.pay # None)
      /\ fk \in WFaultsOf(w)
@@ -734,6 +750,8 @@ Compact(w, fk) ==
         ELSE IF lost /\ Has("compactfail") THEN End(w, s1, "failed", FALSE)
         ELSE IF lost /\ s.crs < CompactResends
           THEN Go(w, [s1 EXCEPT !.pc = "compactread", !.pay = pl, !.cv = cv], FALSE)
+        ELSE IF Has("compactunknown") /\ fk \in {"failBefore", "lostReply", "inflight"}
+          THEN End(w, s1, "unknown", lands)
         ELSE End(w, s1, "committed", lands)
 
 \* After its compaction lost its race, the writer reads the object after the
@@ -752,7 +770,7 @@ CompactRead(w, fk) ==
   LET s == ws[w]
       grown == (Has("compactreplaced") \/ file.inc = s.cv.inc) /\ FileLen(file) >= s.cv.len
       rest == SubSeq(file.log, s.cv.len, Len(file.log))
-      s1 == [Faulted(s, fk) EXCEPT !.pay = None]
+      s1 == [PFaulted(s, fk) EXCEPT !.pay = None]
   IN /\ CanStep(w) /\ s.pc = "compactread"
      /\ fk \in {"none"} \cup (IF CanFault(w) THEN FaultKinds \cap {"readFail"} ELSE {})
      /\ UseFault(fk)
@@ -795,7 +813,7 @@ PrepCas(w, fk) ==
      \* with "rootfirst", a root goes without them
      /\ spages' = IF Has("rootfirst") THEN spages ELSE spages \cup pl.chk.st.sealed
      /\ ws' = [ws EXCEPT ![w] =
-                 [Faulted(s, fk) EXCEPT
+                 [PFaulted(s, fk) EXCEPT
                     !.pay = IF fk = "none" THEN pl
                             ELSE [pl EXCEPT !.log = SelectSeq(@, LAMBDA r : ~IsPo(r))]]]
      /\ UNCHANGED <<file, inflight, now, ended, res, ook, sched, nsw>>
@@ -816,18 +834,22 @@ SweepState(w) ==
      /\ nsw' = nsw + 1
      /\ UNCHANGED <<file, inflight, now, nf, ws, ended, res, ook, sched, store>>
 
-\* A sweep (any compactor) lists the page store and deletes every page the
-\* live catalog does not reference whose node ends at or below its floor:
-\* no PageOut can name it again. With "sweepabove", every page it does not
-\* reference. Deleting the pages a CAS's GC dropped, once it has landed, is
-\* such a sweep.
-Sweep ==
-  LET del == {pg \in store : (\A p \in LiveR.P : PageName(p) # pg)
-                             /\ (Has("sweepabove") \/ Top(pg) <= LiveR.F)}
+\* A sweep (any compactor, LogRuntime.sweep(replica)) lists the page store and
+\* deletes every page the replica R it sweeps from does not reference whose
+\* node ends at or below R's floor: no PageOut can name it again. R is the
+\* live catalog, or a writer's snapshot or base, however stale (the 2026-11-17
+\* review's F6). With "sweepabove", every page R does not reference. Deleting
+\* the pages a CAS's GC dropped, once it has landed, is such a sweep.
+SweepFrom(R) ==
+  LET del == {pg \in store : (\A p \in R.P : PageName(p) # pg)
+                             /\ (Has("sweepabove") \/ Top(pg) <= R.F)}
   IN /\ Paging /\ nsw < MaxSweep /\ del # {}
      /\ store' = store \ del
      /\ nsw' = nsw + 1
      /\ UNCHANGED <<file, inflight, now, nf, ws, ended, res, ook, sched, spages>>
+Sweep ==
+  \/ SweepFrom(LiveR)
+  \/ \E w \in Writers : \E R \in {ws[w].snap, ws[w].base} \ {None} : SweepFrom(R)
 
 Tick ==
   /\ (Retention >= 0 \/ Paging) /\ now < MaxTime
@@ -919,8 +941,26 @@ HonestCommitted == \A e \in ended : e.out = "committed" => e.id \in IdsOf(Hist)
 HonestFailed == \A e \in ended : e.out \in {"failed", "error"} => e.id \notin IdsOf(Hist)
 UnknownExplained == \A e \in ended : e.out = "unknown" => e.cf \/ e.cx
 
-\* A commit no other write raced, on storage that did not fail, commits.
+\* A commit no other write raced, on storage that did not fail its own
+\* requests, commits.
 SoloCommits == \A e \in ended : (~e.cf /\ ~e.ci) => e.out = "committed"
+
+\* A commit whose record a read found applied is reported committed,
+\* whatever becomes of its compaction (LOG.md: "the commit stands").
+CommitStands == \A e \in ended : e.judged => e.out = "committed"
+
+\* A commit reported failed has a cause: another transaction applied since
+\* the snapshot it staged on, its id crossed the horizon or the floor, it ran
+\* out of attempts, or its own requests failed.
+FailedExplained ==
+  \A e \in ended : e.out = "failed" => e.rc \/ e.cx \/ e.ex \/ e.bf \/ e.cf
+
+\* GC honours the retention, and paging the admission window: the horizon
+\* stays a retention behind the latest clock, the floor (above the horizon)
+\* an admission window behind it.
+MaxSkew == CHOOSE m \in {Skew[w] : w \in Writers} : \A w \in Writers : Skew[w] <= m
+RetentionHonoured == Retention >= 0 => LiveR.H <= Max(0, 1 + now + MaxSkew - Retention)
+FloorHonoured == LiveR.F <= Max(LiveR.H, 1 + now + MaxSkew - Admission)
 
 \* What history the catalog holds only grows, by one transaction at a time.
 HistGrows ==
@@ -973,7 +1013,7 @@ OnGrid == OnGridIn(file.log)
 Safety ==
   Readable /\ NoUnheldState /\ ExactlyOnce /\ Serializable /\ UniqueIds
     /\ HonestCommitted /\ HonestFailed /\ UnknownExplained /\ PagesExist /\ PagesExact
-    /\ StatePagesExist
+    /\ StatePagesExist /\ CommitStands /\ FailedExplained /\ RetentionHonoured /\ FloorHonoured
 
 \* Every writer finishes.
 Termination == <>[](\A w \in Writers : ws[w].pc = "idle" /\ ws[w].k > Len(Shapes[w]))
