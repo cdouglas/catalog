@@ -284,7 +284,9 @@ and each bug switch, three checks:
 
 Each fuzzer is run only with what it draws. The race property injects no
 faults, reads leniently and draws no segment cap. `race1` is the race with
-one racer: with two, in this two-entity model, A always conflicts.
+one racer: with two, in this two-entity model, A always conflicts. Bugs 26
+and 64a need a resend after a probe, so their rows run with tail reads off,
+as their configurations `bug26` and `bug64a` do.
 
 | Bug | MW | fault | race / race1 |
 |---|---|---|---|

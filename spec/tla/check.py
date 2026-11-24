@@ -773,8 +773,10 @@ BUG_KNOBS = {
     "17": {**F1},
     "18": {"MaxFaults": "2", "FaultKinds": FUZZER_FAULTS},
     "25": {**F1, "MaxThrottle": "1"},
-    "26": {"Strict": "TRUE", "MaxSize": "2"},
-    "64a": {**GC},
+    # Bugs 26 and 64a need a resend after a probe, without a read (as their configurations bug26
+    # and bug64a): with tail reads the loop reads, and judges the record, before it resends.
+    "26": {"Strict": "TRUE", "MaxSize": "2", "TailReads": "FALSE"},
+    "64a": {**GC, "TailReads": "FALSE"},
     "64b": {**GC},
     "64c": {**GC, "skew": True},
     "64d": {**GC, **F1},
