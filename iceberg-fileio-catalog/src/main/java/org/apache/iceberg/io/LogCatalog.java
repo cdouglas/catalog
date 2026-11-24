@@ -2344,7 +2344,10 @@ public class LogCatalog extends BaseMetastoreViewCatalog
      * parent's this commit sends (a new one, or with {@code full}, one whose list the table has
      * lost: Bug 68), a parent's inline in {@code proto}, or a sealed parent's the commit brings
      * back ({@link #broughtBack}: a ref moves onto it), which replay holds inline before the delta
-     * applies (Bug 135 (brought-back parent's list added twice)). Null if the parent's list is not
+     * applies (Bug 135 (brought-back parent's list added twice)), if its list was inline when it
+     * was sealed: a sealed snapshot whose list is a file (its table's history while a pointer
+     * writer had evicted it) comes back with its leaf naming the file, and replay holds no inline
+     * list for it (Bug 138 (staged on brought-back file list)). Null if the parent's list is not
      * inline.
      */
     private List<ManifestFile> parentList(
@@ -2366,10 +2369,20 @@ public class LogCatalog extends BaseMetastoreViewCatalog
         return proto.inlineManifests(tblId, parentId);
       }
       if (tblId != null && parent != null && proto.sealedBlockOf(tblId, parentId) != null
+          && namesNoListFile(parent)
           && metadata.refs().values().stream().anyMatch(ref -> ref.snapshotId() == parentId)) {
         return parent.allManifests(io());
       }
       return null;
+    }
+
+    /**
+     * Whether {@code snapshot} names no manifest list file: its list is inline (an {@code
+     * InlineSnapshot}, whose location is null, or the {@code inline://} sentinel).
+     */
+    private static boolean namesNoListFile(Snapshot snapshot) {
+      String location = snapshot.manifestListLocation();
+      return location == null || location.startsWith("inline://");
     }
 
     /**

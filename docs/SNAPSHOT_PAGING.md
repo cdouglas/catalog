@@ -265,7 +265,12 @@ without reading the page:
   read as gone)). Its writer builds that snapshot's list on the
   brought-back list too, as replay does, not as a whole list on a parent
   it holds no inline list for (Bug 135 (brought-back parent's list added
-  twice)).
+  twice)), whether the record is a delta or a full update. A sealed
+  snapshot whose list is a file (the table's history while a pointer
+  writer had evicted it) comes back with its leaf naming the file, so
+  replay holds no inline list for it, and a snapshot on it carries its
+  whole list, as on any parent whose list is a file (Bug 138 (staged on
+  brought-back file list)).
 
 Any other record that needs a sealed snapshot's content conflicts with the
 same reason: a commit whose parent is sealed (a stale writer, a stale

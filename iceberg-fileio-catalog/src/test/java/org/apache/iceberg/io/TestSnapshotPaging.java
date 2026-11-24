@@ -440,6 +440,78 @@ class TestSnapshotPaging {
   }
 
   /**
+   * Bug 138 (staged on brought-back file list): a sealed snapshot whose list is a file (the table's
+   * history while a pointer writer's commit had evicted it, its lists written to files) comes back
+   * with its leaf naming the file, so replay holds no inline list for it. A snapshot a transaction
+   * stages on it after rolling main back onto it carries its whole list, as on any parent whose
+   * list is a file. Its writer sent it as changes of the parent's list (Bug 135's rule, for a
+   * parent whose list comes back inline), and replay applied them to no list: the staged snapshot
+   * listed only its own manifest. Found on a v3 table, whose staged list gave the parent's
+   * manifests first row ids (a full update); here, as a delta and as a full update (the
+   * transaction also removes a branch, which no delta does).
+   */
+  @ParameterizedTest
+  @EnumSource(names = {"APPEND_ML", "COMPACT_ML", "CAS_TM", "MEMLOG_ML"})
+  void aTransactionStagesOnASealedFileListItBringsBack(LocalCatalogMode mode) throws Exception {
+    stageOnASealedFileList(mode, false);
+  }
+
+  @ParameterizedTest
+  @EnumSource(names = {"APPEND_ML", "COMPACT_ML", "CAS_TM", "MEMLOG_ML"})
+  void aFullUpdateStagesOnASealedFileListItBringsBack(LocalCatalogMode mode) throws Exception {
+    stageOnASealedFileList(mode, true);
+  }
+
+  private void stageOnASealedFileList(LocalCatalogMode mode, boolean full) {
+    LogCatalog writer = mode.catalog(io, WAREHOUSE, "back", paging(4, 8));
+    writer.createNamespace(Namespace.of("ns"));
+    Table table = writer.buildTable(TABLE, SCHEMA).withPartitionSpec(SPEC).create();
+    List<Long> ids = new ArrayList<>();
+    for (int i = 0; i < 6; i++) {
+      append(table, i);
+      ids.add(table.currentSnapshot().snapshotId());
+    }
+    // a pointer writer's commit evicts the table, its lists written to files; the inline writer's
+    // next commit brings it back inline, those snapshots' lists still files
+    LocalCatalogMode pointerMode =
+        mode == LocalCatalogMode.MEMLOG_ML ? LocalCatalogMode.MEMLOG : LocalCatalogMode.APPEND;
+    Table pointerTable = pointerMode.catalog(io, WAREHOUSE, "back", paging(4, 8)).loadTable(TABLE);
+    append(pointerTable, 6);
+    ids.add(pointerTable.currentSnapshot().snapshotId());
+    table.refresh();
+    for (int i = 7; i < 30; i++) {
+      append(table, i);
+      ids.add(table.currentSnapshot().snapshotId());
+    }
+    table.manageSnapshots().createBranch("x", ids.get(29)).commit();
+    CatalogState state = writer.log().read().state();
+    int tblId = state.tableId(TABLE);
+    long rolledBack = ids.get(5);
+    assertThat(state.sealedBlockOf(tblId, rolledBack)).isNotNull();
+
+    org.apache.iceberg.Transaction txn = table.newTransaction();
+    txn.manageSnapshots().rollbackTo(rolledBack).commit();
+    txn.newFastAppend().appendFile(file(100)).stageOnly().commit();
+    if (full) {
+      txn.manageSnapshots().removeBranch("x").commit();
+    }
+    txn.commitTransaction();
+
+    Table fresh = mode.catalog(io, WAREHOUSE, "back", paging(4, 8)).loadTable(TABLE);
+    assertThat(fresh.currentSnapshot().snapshotId()).isEqualTo(rolledBack);
+    assertThat(fresh.refs().containsKey("x")).isEqualTo(!full);
+    Snapshot staged = current(fresh).snapshots().stream()
+        .filter(s -> !ids.contains(s.snapshotId())).findFirst().orElseThrow();
+    assertThat(staged.parentId()).isEqualTo(rolledBack);
+    List<String> parent = fresh.snapshot(rolledBack).allManifests(fresh.io()).stream()
+        .map(ManifestFile::path).toList();
+    List<String> list = staged.allManifests(fresh.io()).stream()
+        .map(ManifestFile::path).toList();
+    assertThat(parent).hasSize(6);
+    assertThat(list).doesNotHaveDuplicates().hasSize(parent.size() + 1).containsAll(parent);
+  }
+
+  /**
    * A rollback to a sealed snapshot, and a tag on one, bring it back inline with its proof: the
    * table then reads as its writer committed it, through a fresh catalog, and the snapshot leaves
    * its block's live ids. A proof for another place, or a forged leaf, proves nothing.
