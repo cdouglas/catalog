@@ -3546,12 +3546,15 @@ public class ProtoCodec {
 
     /**
      * Whether the update's manifest updates (a delta's, or those a FULL update carries) add a path
-     * the table's pool holds with an entry that differs from the pool's (SPEC_ML.md,
-     * AddManifestDelta). Every list that names a path shares its entry, so such an update would
-     * change lists that never change: it does not apply. Writers never send one (an update that
-     * would change a pooled entry evicts the table: LogCatalog's restatesAManifest). A delta
-     * admitted on a later version adds no pooled path ({@link Landing#unmergeable}), so the check
-     * meets only an update on the version it read, where its entries are as its writer sent them.
+     * with an entry that differs from the one the table's pool holds for it, or from the one an
+     * earlier update of the record adds for it (SPEC_ML.md, AddManifestDelta). Every list that
+     * names a path shares its entry, so such an update would change lists that never change, or
+     * pool one of two entries over the other (errata U9, round p26-r0: a retried transaction's two
+     * snapshots naming one manifest at different sequence numbers): it does not apply. Writers
+     * never send one (an update that would change a pooled entry evicts the table: LogCatalog's
+     * restatesAManifest). A delta admitted on a later version adds no pooled path ({@link
+     * Landing#unmergeable}), so the check meets only an update on the version it read, where its
+     * entries are as its writer sent them.
      */
     private boolean restatesPooledManifest(CatalogState.Builder builder) {
       InlineDeltaCodec.DecodedDelta manifests;
@@ -3569,11 +3572,23 @@ public class ProtoCodec {
         return false;
       }
       String prefix = builder.manifestListPrefix(id);
+      // the entries the record adds, by resolved path, each resolved only if its path comes again
+      Map<String, ManifestFile> added = new HashMap<>();
       for (InlineDeltaCodec.DeltaUpdate update : manifests.updates) {
         if (update instanceof InlineDeltaCodec.AddManifestUpdate) {
           ManifestFile manifest = ((InlineDeltaCodec.AddManifestUpdate) update).manifest;
-          if (builder.restatesPooledManifest(id, InlineDeltaCodec.resolvedPath(manifest, prefix),
+          if (manifest == null) {
+            continue;
+          }
+          String path = InlineDeltaCodec.resolvedPath(manifest, prefix);
+          if (builder.restatesPooledManifest(id, path,
               () -> InlineDeltaCodec.resolve(manifest, prefix))) {
+            return true;
+          }
+          ManifestFile earlier = added.putIfAbsent(path, manifest);
+          if (earlier != null && earlier != manifest
+              && !CatalogState.Builder.samePoolEntry(InlineDeltaCodec.resolve(earlier, prefix),
+                  InlineDeltaCodec.resolve(manifest, prefix))) {
             return true;
           }
         }

@@ -147,6 +147,65 @@ class TestPooledManifests {
         .isEqualTo(pooled.snapshotId());
   }
 
+  @Test
+  void aDeltaThatNamesANewManifestTwiceWithEqualEntriesApplies() {
+    String path = base.location() + "/metadata/twice-m0.avro";
+    Replica<CatalogState> landed = commitDelta(
+        twoListsNaming(newManifest(path, 3L), newManifest(path, 3L)));
+
+    assertThat(landed.state().snapshotManifests(tblId).get(33L)).first().isEqualTo(path);
+    assertThat(landed.state().snapshotManifests(tblId).get(34L)).first().isEqualTo(path);
+    assertThat(landed.state().manifestPool(tblId).get(path).sequenceNumber()).isEqualTo(3L);
+    assertThat(rejectedInTheLog()).isEmpty();
+    CheckpointRoundTrip.assertEveryWrite(io);
+  }
+
+  /**
+   * Errata U9 (record restates pooled path): a record whose lists name one path the pool lacks
+   * with two entries (round p26-r0's rebase.4, a retried transaction's two snapshots, the
+   * manifest's sequence numbers differing, before C36 was fixed) passed the check against the
+   * pool before it, and replay then pooled one entry over the other (under the replay check, a
+   * {@code ReplayCheckError}). It restates its own pooled entry: it does not apply.
+   */
+  @Test
+  void aDeltaThatNamesANewManifestTwiceWithDifferentEntriesDoesNotApply() {
+    String path = base.location() + "/metadata/twice-m0.avro";
+    assertThatThrownBy(() -> commitDelta(
+            twoListsNaming(newManifest(path, 3L), newManifest(path, 4L))))
+        .isInstanceOf(CommitFailedException.class);
+
+    assertThat(log.counts().conflictReasons())
+        .containsExactly(Map.entry(ProtoCodec.POOL_RESTATED, 1L));
+    assertThat(rejectedInTheLog()).containsExactly(Map.entry(ProtoCodec.POOL_RESTATED, 1L));
+    CatalogState after = CatalogTestSupport.log(io, CATALOG).read().state();
+    assertThat(after.snapshotManifests(tblId)).doesNotContainKeys(33L, 34L);
+    assertThat(after.manifestPool(tblId)).doesNotContainKey(path);
+  }
+
+  /** A data manifest at {@code path} the head's snapshot added, at sequence number {@code seq}. */
+  private ManifestFile newManifest(String path, long seq) {
+    return InlineDeltaCodec.manifestFile(pooled, path, seq, seq, pooled.firstRowId());
+  }
+
+  /**
+   * New snapshots 33, main's new head, and 34, branch b's, both on the head, each listing {@code
+   * first} and {@code second} first, before the head's manifests.
+   */
+  private List<DeltaUpdate> twoListsNaming(ManifestFile first, ManifestFile second) {
+    Map<String, String> summary = new HashMap<>();
+    summary.put("operation", "append");
+    List<DeltaUpdate> updates = new ArrayList<>();
+    updates.add(new AddSnapshotUpdate(
+        33L, "", summary, false, List.of(), 0L, null, null, head, null, null, null));
+    updates.add(new AddSnapshotUpdate(
+        34L, "", summary, false, List.of(), 0L, null, null, head, null, null, null));
+    updates.add(new SetSnapshotRefUpdate("main", 33L, "branch", 0, 0L, 0L));
+    updates.add(new SetSnapshotRefUpdate("b", 34L, "branch", 0, 0L, 0L));
+    updates.add(new AddManifestUpdate(33L, first, prefix, 0));
+    updates.add(new AddManifestUpdate(34L, second, prefix, 0));
+    return updates;
+  }
+
   /** The head's other manifest, the second append's. */
   private String other() {
     return read.state().snapshotManifests(tblId).get(head).get(0);

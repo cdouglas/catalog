@@ -161,7 +161,8 @@ inline list (empty for none). On apply:
   if it is absent. Writers always set it. A pooled path's entry never
   changes: every list that names the path shares it. A path the pool
   holds must come with an entry equal to the pool's in every field,
-  which the pool keeps; an update (a delta, or the manifest updates a
+  which the pool keeps, and a path an update adds more than once with
+  one entry each time; an update (a delta, or the manifest updates a
   full update carries) that adds one with another entry does not apply
   (`pool: restates a pooled manifest`). Writers never send one: an
   entry Iceberg would restate, a first row id the first v3 commit gives
