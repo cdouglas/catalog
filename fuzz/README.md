@@ -84,7 +84,10 @@ so: a soak round stands aside for anyone who needs it. A queued run that would f
 rounds stopped stops the newest; and when the room falls below the reserve (another user's
 demand grew), the newest soak round is stopped and none starts for `SOAK_BACKOFF` seconds (default
 1800). A stopped round keeps its logs, but its unfinished shards' seeds are lost. `soak off`
-stops it starting more.
+stops it starting more. An unattended soak runs beside `soak-guard.sh <file> <deadline> [low]
+[high]`, which pauses it (`soak off`) while `/data` has under 40 GiB free and appends its soak
+line again once it has 60, so soaking resumes; at the deadline it ends it. A round's logs take
+about 0.7 GB.
 A round's faultA2 and faultB2 page snapshots at blocks of 2 and a window of 1, and fail if too
 few of their tries seal a block; the other jobs run at the catalog's default, which seals nothing
 in their short schedules. `SNAPSHOT_BLOCK` (and `SNAPSHOT_WINDOW`) sets paging for every job of a
