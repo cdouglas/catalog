@@ -16,7 +16,7 @@ none of them. `TestIcebergCoreIssues` asserts each is absent; on stock Iceberg
 
 An entry's ID is not reused: a finished entry is deleted and its ID retired.
 Retired: S3-S5, D1-D3, D5-D7, D9, D10, D11, D15, D17, D19, D20, D23, D24, D26, D29, T1, T2,
-T4, T5, T7, T8, U2, U3, U8
+T4, T5, T7, T8, U2, U3, U7, U8
 (`git log -p docs/errata.md` has each; the plans in TAIL_READS.md,
 CHECKPOINT_PLAN.md and SNAPSHOT_PAGING.md cite them by ID and summary). Five
 IDs (S2, D9, D10, T4, T5) were reused before this rule, so an older code
@@ -660,27 +660,6 @@ measured at E1's and E3's points on `s3x-2026-11`. Still to take:
   Iceberg's retry, whose longer backoff throttled the writers).
 
 **Trigger:** before the paper's cloud runs.
-
-### U7. A stale handle on a pointer table fails where an inline one commits (stale handle reads expired list)
-
-Round p26-r0 (fileio ec3c267, fork p20, 2026-11-20), shard `diff.6`:
-`TestInlineDifferentialProperties.inlineCatalogReadsLikeAPointerCatalog`, seed
--3033262475300780792 at 273 tries, failing at the last (v3 unpartitioned,
-`APPEND_TM`). The schedule expires snapshots, tags, appends, and then a handle
-loaded before the expiry rewrites files. In the pointer catalog the rewrite is
-rejected (`NotFoundException` for an expired snapshot's manifest list, which
-the expiry deleted): a stale read. In the inline catalog it commits, because the
-stale handle holds its lists in memory. The oracle lets a stale-read rejection
-match any rejection in the other arm (fileio ec3c267), but not a commit there.
-
-To settle: does the inline commit land what Iceberg would commit on a refresh,
-so that the oracle should also accept a stale read in one arm beside a commit
-in the other, or does it land a rewrite on files the expiry removed, so that the
-inline catalog should refuse it? The failure's excerpt is in
-`~/work/.replays/p26-r0/diff.6.failure.txt`, and the whole log is on havoc at
-`~/data/ce-fuzz-p16g/out/p26-r0/diff.6.log.gz`.
-
-**Trigger:** the triage of the week of 2026-11-23. Replay the seed first.
 
 ### U9. A record may name one manifest path twice with different entries (record restates pooled path)
 

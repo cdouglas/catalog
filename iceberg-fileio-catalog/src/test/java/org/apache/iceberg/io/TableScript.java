@@ -329,7 +329,25 @@ final class TableScript {
           .withPartitionSpec(spec)
           .withProperty(TableProperties.FORMAT_VERSION, String.valueOf(formatVersion))
           .create();
-      this.stale = other.loadTable(ID);
+      this.stale = loadStale();
+    }
+
+    /**
+     * A handle on the table from the other catalog, its current snapshot's manifest list read, as a
+     * reader's is once it planned a scan. An inline catalog's loads of one version share its
+     * snapshots ({@code InlineTable.loaded}), so a commit through another handle that read the list
+     * leaves it cached for this one, where each of a pointer catalog's loads parses its own: a
+     * handle whose snapshot an expiry removes would read on in one catalog and fail in the other
+     * (errata U7, round p26-r0). Read here, it holds the list in both, as a handle that scanned
+     * does; its manifests it reads as the table has them.
+     */
+    private Table loadStale() {
+      Table handle = other.loadTable(ID);
+      Snapshot current = handle.currentSnapshot();
+      if (current != null) {
+        current.allManifests(handle.io());
+      }
+      return handle;
     }
 
     /**
@@ -400,7 +418,7 @@ final class TableScript {
       if (first.kind == Kind.STALE) {
         trace.append("stale ").append(step.subList(1, step.size())).append('\n');
         Table handle = stale;
-        this.stale = other.loadTable(ID);
+        this.stale = loadStale();
         try {
           Cmd member = step.size() > 1 ? step.get(1) : null;
           // a stale handle runs one table command: not a replace, a transaction or another STALE
