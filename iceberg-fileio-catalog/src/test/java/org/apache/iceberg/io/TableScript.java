@@ -290,6 +290,8 @@ final class TableScript {
     /** Where the files this runner adds go: the start of their paths. */
     private final String names;
     private int nextFile = 0;
+    // The names a rejected step takes, whatever it wrote (run)
+    private static final int REJECTED_STEP_NAMES = 100;
     private int nextValue = 0;
     // A transaction's members leave the metadata log's bound alone (ICEBERG_ISSUES.md A6)
     private boolean inTransaction = false;
@@ -378,6 +380,21 @@ final class TableScript {
 
     /** Runs {@code step}; returns the exception that rejected it, or null if it committed. */
     RuntimeException run(List<Cmd> step) {
+      // A rejected step's files take their names from a range of its own, so how far it got before
+      // its rejection (a stale read before it wrote, a validation after) leaves the names of later
+      // steps alike in every catalog that rejected it (round p27-s, diff.4)
+      int start = nextFile;
+      RuntimeException rejected = runStep(step);
+      if (rejected != null) {
+        if (nextFile - start >= REJECTED_STEP_NAMES) {
+          throw new AssertionError("a rejected step named " + (nextFile - start) + " files");
+        }
+        nextFile = start + REJECTED_STEP_NAMES;
+      }
+      return rejected;
+    }
+
+    private RuntimeException runStep(List<Cmd> step) {
       staleRejection = null;
       Cmd first = step.get(0);
       if (first.kind == Kind.STALE) {
