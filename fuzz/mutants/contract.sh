@@ -27,9 +27,18 @@
 # checkpoint and records writes an earlier version's bytes, which an S3 general-purpose bucket's
 # ETag (a hash of them) cannot tell apart. TestAtomicFileLog's
 # aReplaceNeverWritesAnEarlierVersionsBytes alone fails it (2026-11-20).
-MUTANTS="casoverappend appendoverreplace pageplain fixedinc"
+#
+# The store's contract (API5, the fork's SupportsAtomicOperationsContractTest, which
+# TestInMemoryAtomicFileIOContract runs on this store): casoverappend also fails its
+# casFromAVersionAnAppendExtendedFails and casAndAppendRaceConcurrent (fork atomicio 0d7d213f4e;
+# locally 2026-11-24). The append limit (maxAppendBytes; the suite's CappedAppends caps it at 1 KiB):
+# appendlimitlost reports an append past it as a lost race, which a caller sends again as it is;
+# appendlimitlands lands an append a byte past it; appendlimitcas caps a CAS too.
+# appendPastMaxAppendBytesIsRefusedAndLandsNothing fails the first two, and the suite's CASes of
+# more than the cap the third (2026-11-24).
+MUTANTS="casoverappend appendoverreplace pageplain fixedinc appendlimitlost appendlimitlands appendlimitcas"
 EQUIVALENT=""
-ORACLES=TestAtomicFileLogContract,TestInMemorySharedLogContract,TestSegmentedLogContract,TestAtomicFileLog
+ORACLES=TestAtomicFileLogContract,TestInMemorySharedLogContract,TestSegmentedLogContract,TestAtomicFileLog,TestInMemoryAtomicFileIOContract*
 
 IO=intentlog-fileio/src/test/java/org/apache/iceberg/io/InMemoryAtomicFileIO.java
 FILELOG=intentlog-fileio/src/main/java/org/intentlog/fileio/AtomicFileLog.java
@@ -49,6 +58,14 @@ mutant() { # name main-dir test-dir (the catalog's; these mutants are intentlog'
             && live != null && live.segments == 1)) {" ;;
     # every replace draws the same incarnation
     fixedinc) mutate $FILELOG "    this(io, location, () -> ThreadLocalRandom.current().nextLong(), lookupFirst);" "    this(io, location, () -> 42L, lookupFirst);" ;;
+    # an append past the store's limit fails as a lost race, not refused
+    appendlimitlost) mutate $IO "              data.length, location, appendByteLimit);
+          throw new StorageRefusedException(msg, new IOException(msg));" "              data.length, location, appendByteLimit);
+          throw new SupportsAtomicOperations.AppendException(msg, new IOException(msg));" ;;
+    # an append a byte past the store's limit lands
+    appendlimitlands) mutate $IO "        if (strategy == Strategy.APPEND && appendByteLimit > 0 && data.length > appendByteLimit) {" "        if (strategy == Strategy.APPEND && appendByteLimit > 0 && data.length > appendByteLimit + 1) {" ;;
+    # the limit on an append's bytes caps a CAS too
+    appendlimitcas) mutate $IO "        if (strategy == Strategy.APPEND && appendByteLimit > 0 && data.length > appendByteLimit) {" "        if (appendByteLimit > 0 && data.length > appendByteLimit) {" ;;
     # a page put rewrites the page in place, a plain write
     pageplain) mutate $FILELOG "        AtomicOutputFile out = io.newOutputFile(io.newInputFile(prefix + name));
         CAS token = out.prepare(() -> new ByteArrayInputStream(page), AtomicOutputFile.Strategy.CAS);

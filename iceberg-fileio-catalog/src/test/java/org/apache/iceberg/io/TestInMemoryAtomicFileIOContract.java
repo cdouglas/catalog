@@ -49,6 +49,26 @@ class TestInMemoryAtomicFileIOContract extends SupportsAtomicOperationsContractT
     }
   }
 
+  /** With appends capped, as Azure caps an AppendBlock (InMemoryAtomicFileIO.limitAppendBytes). */
+  @Nested
+  class CappedAppends extends SupportsAtomicOperationsContractTest {
+    private final InMemoryAtomicFileIO store = new InMemoryAtomicFileIO();
+
+    CappedAppends() {
+      store.limitAppendBytes(1024);
+    }
+
+    @Override
+    protected SupportsAtomicOperations newFileIO() {
+      return store;
+    }
+
+    @Override
+    protected String randomLocation(String slug) {
+      return "mem:///contract/" + randomSlug(slug);
+    }
+  }
+
   @Nested
   class RecordingPinnedReads extends SupportsAtomicOperationsContractTest {
     private final InMemoryAtomicFileIO store = new InMemoryAtomicFileIO();
