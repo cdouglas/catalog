@@ -142,8 +142,8 @@ Line numbers are of `LogRuntime.java` at 6a4c762 unless stated. `TestLogRuntime`
 | `Write` (APPEND) | `log.append` :1538, `write` :1788 | all |
 | `Write` with `SegOK` false | `catch LogFullException` :1539 (Bug 66 (append cap never compacted)) | MW, fault (segment limits drawn) |
 | `Write` with faults | `write` :1788; the store's signals mapped by `AtomicFileLog.write` | MW, fault (`InMemoryAtomicFileIO.Fault`) |
-| `ReadBack` | `write`'s `readThrough` :1826, `validate` :2049; `AtomicFileLog` answers it from the write when the write says what the object holds (a replace; an append from a tail whose bytes it read or wrote), with no request: the same view, since every write gives the object a version of its own (errata D20) | all; strict versions: MW, fault |
-| `Rebase` | `catch LogConflictException` :1511 and the read after it :1521 | all |
+| `ReadBack` | `write`'s `readThrough` :1826, `validate` :2049; `AtomicFileLog` answers it from the write when the write says what the object holds (errata D20), with no request, so no read fault or strict refusal: a replace's view is the checkpoint and records it wrote (`ReplayOf(s.written)`), an append's from a tail whose bytes the writer read or wrote is the replica it holds and its record, folded onto that replica (`OwnFold`); after a probe (`stale`) the version written is read back | all; strict versions: MW, fault |
+| `Rebase` | `catch LogConflictException` :1511 and the read after it :1521; like every read of the loop (`Commit.read` :1860), with tail reads a read of what follows the replica the commit holds (`LoopViews`), else whole | all |
 | `Refresh` | `catch LogConflictException` :1547, `probe().continues` :1580 | all |
 | `Shrink` | the read when the log was replaced :1585 | MW |
 | `FreshForCAS` | `mustReplace` with `stale` :1484 (Bug 12 (compacted the stale snapshot), Bug 26 (retry compacted without reading)) | MW |
@@ -151,7 +151,7 @@ Line numbers are of `LogRuntime.java` at 6a4c762 unless stated. `TestLogRuntime`
 | `Exhaust`, `FinalRead` | after the loop :1638, :1641 | MW (faults) |
 | `Unreadable` | `catch UnreadableLog` :1627 | MW, fault (read faults) |
 | `Judge` | `landed` :1957; `CommittedSet.Builder.contains` (`CommittedSet.java:1306`) | MW, fault, race (gc) |
-| `Restage` | `LogCatalog.commitOnAFreshRead` (`LogCatalog.java:611`); Iceberg's table commit retry | fault, race |
+| `Restage` | `LogCatalog.commitOnAFreshRead` (`LogCatalog.java:611`); Iceberg's table commit retry; with tail reads, a read of what follows the replica the failed commit held | fault, race |
 | `Replay`, `Fold` | `Replay.replayOnto` (`Replay.java:219`), `mayApply` (`CommittedSet.java:1311`), `CatalogIntention.verify` (`ProtoCodec.java:2275`) | all (every read), `CheckpointRoundTrip` |
 | `LandInflight` | none: a timed-out request that lands later | none |
 | `Tick`, `Skew` | the runtime's clock (`RuntimeConfig.clockMs`) | gc runs (wall clock); no fuzzer skews clocks |
@@ -951,9 +951,16 @@ unique per attempt) for every frame it writes, and an append frames its record
 with the incarnation of the version its condition names, `cur.inc`, which a
 writer takes from the read it staged or rebased on. `Readable` now also asks
 that every frame name the object (`FramesTrue`): a checked read of an object
-holding another's frame fails, forever. A new invariant, `NoUnheldState`, asks
-that every writer's replica be a state the object held (each read marks its
-view `held`).
+holding another's frame fails, forever. `NoUnheldState` asks that every
+replica a writer holds (the one it stages or rebases on, `base`, and the one
+its record landed in, `lr`, which its compaction checkpoints) be a state the
+object held: the replay of a version in `versions`, a history of every version
+the object took. The model builds a replica as the runtime does, never from the
+live object where the runtime does not read it: a tail read folds the records
+after the replica onto it, a read through a write the writer's record (`OwnFold`,
+errata D20), and so a mistake in either is a state no version held (the 2026-11-17
+review's F2). The reads that start an operation (`Begin`, `BeginNested`) are
+whole reads.
 
 After an append loses its race the loop tail-reads (`TailRead`, with
 `TailReads` TRUE, the default): if the object is still the incarnation of the
@@ -969,6 +976,7 @@ read pinned to it).
 | `lengthonly` | a tail read that compares lengths only (`FileTail.continues` before step 5): a longer replace reads as growth, and its records are folded onto a replica of another incarnation | `NoUnheldState` |
 | `notrailer` | whole reads whose frames are not checked (format 2): a read torn by a write between its lookup and its GET (`Spliced`: the bound version's checkpoint and first records, the live version's after them) is replayed | `NoUnheldState` |
 | `probeinc` | a resend after a probe framed with the incarnation the writer last read (A4 broken) | `Readable` |
+| `d20stale` | a read through an append after a probe answered from the write, as if the replica the writer holds were the version its condition named: the view misses the records that beat the first send, and a compaction of it would erase them (on `after-probe`'s bounds; without `NoUnheldState`, `HonestCommitted` breaks: the view applies a record the object rejected) | `NoUnheldState` |
 
 **The shared-log model.** A compactor's read may be served with a gap after its
 checkpoint (`ReadFromGap`); the runtime refuses it (LOG.md "Positions"), so

@@ -761,7 +761,12 @@ Each step stands alone and is measured before the next:
    frame name its object), and the shared log's `nojoint` breaks
    `Deterministic`. Bugs 26, 64a and `floorgap` reach their violations only
    through a resend after a probe, so their calibrations run with tail reads
-   off.
+   off. `NoUnheldState` compares each replica a writer holds with a history
+   of the versions the object held, and the model builds replicas as the
+   runtime does: every read of the commit loop a tail read from the replica
+   it holds, a read through a write from the write (D20), whose switch
+   `d20stale` (an append after a probe answered from the write) breaks it
+   (the 2026-11-17 review's F2).
 5. **Tail reads.** `readAfter`, `read(floor)`, the commit loop, the switch,
    the mutants, havoc rounds.
    Built 2026-11-10. `AtomicFileLog.readAfter` is the tail read of

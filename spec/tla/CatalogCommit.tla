@@ -90,7 +90,7 @@ ASSUME /\ FaultKinds \subseteq WriteFaults \cup ReadFaults \cup PutFaults
                           "64a", "64b", "64c", "64d", "66", "ckgc", "basever",
                           "floorgap", "nodigest", "absentpage", "sweepabove", "mintH",
                           "pageown", "rootfirst", "sweepstale",
-                          "lengthonly", "notrailer", "probeinc",
+                          "lengthonly", "notrailer", "probeinc", "d20stale",
                           "compactbase", "compactresend", "compactfail",
                           "compactcopyafter", "compactreplaced", "compactunknown",
                           "noretention",
@@ -113,9 +113,10 @@ VARIABLES
              \*  active one; racers: who ran inside one]
   store,     \* the page store: the names of the pages in it
   nsw,       \* sweeps so far
-  spages     \* the state's pages stored (SNAPSHOT_PAGING.md): [e, v] names
+  spages,    \* the state's pages stored (SNAPSHOT_PAGING.md): [e, v] names
+  versions   \* a history: the replay (Ck) of every version the object has held
 
-vars == <<file, inflight, now, nf, ws, ended, res, ook, sched, store, nsw, spages>>
+vars == <<file, inflight, now, nf, ws, ended, res, ook, sched, store, nsw, spages, versions>>
 PageVars == <<store, nsw, spages>>
 
 -----------------------------------------------------------------------------
@@ -129,14 +130,13 @@ InitFile == [gen |-> 1, chk |-> [st |-> InitSt, C |-> {}, H |-> 0, F |-> 0, P |-
 
 \* A read: the replayed state, what replay did with the record of `watch`,
 \* the version read and its length (in records, the checkpoint counting
-\* one), the intention-record count (intentionRecords), the incarnation, and
-\* whether the view is a state the object held (held: the oracle that no
-\* replica holds a state the log never held).
+\* one), the intention-record count (intentionRecords) and the incarnation.
+\* Whether it is a state the object held, NoUnheldState asks of `versions`.
 ReplayOf(f, watch) ==
   LET a == Fold(Acc(f.chk.st, f.chk, watch), f.log)
   IN [st |-> a.st, C |-> a.C, H |-> a.H, F |-> a.F, P |-> a.P, err |-> a.err, out |-> a.out,
       cnt |-> Len(Txns(f.log)), gen |-> f.gen, len |-> Len(f.log) + 1, rf |-> a.rf,
-      inc |-> f.inc, held |-> TRUE]
+      inc |-> f.inc]
 
 Replay(f) == ReplayOf(f, None)
 
@@ -159,8 +159,7 @@ FramesTrue == \A i \in DOMAIN file.fi : file.fi[i] = file.inc
 Spliced(k, watch) ==
   LET b == file.prev
       lg == SubSeq(b.log, 1, k) \o SubSeq(file.log, k + 1, Len(b.log))
-      R == ReplayOf([gen |-> b.gen, chk |-> b.chk, log |-> lg, inc |-> b.inc], watch)
-  IN [R EXCEPT !.held = (b.inc = file.inc)]
+  IN ReplayOf([gen |-> b.gen, chk |-> b.chk, log |-> lg, inc |-> b.inc], watch)
 
 \* The reads a whole read may return: the live object, and with "notrailer"
 \* a splice of it and the version before (the checks are off).
@@ -180,9 +179,36 @@ Folded(R, cur, watch) ==
       a == Fold([Acc(R.st, R, watch) EXCEPT !.out = R.out], rest)
   IN [st |-> a.st, C |-> a.C, H |-> a.H, F |-> a.F, P |-> a.P, err |-> a.err, out |-> a.out,
       cnt |-> R.cnt + Len(Txns(rest)), gen |-> file.gen, len |-> FileLen(file), rf |-> a.rf,
-      inc |-> R.inc, held |-> R.held /\ file.inc = R.inc]
+      inc |-> R.inc]
 TailViews(R, cur, watch) ==
   IF Continues(cur) THEN {Folded(R, cur, watch)} ELSE WholeReads(watch)
+
+\* The reads a commit's loop makes (LogRuntime.Commit.read), watching its
+\* record: with tail reads, of what follows the replica it holds; without,
+\* the live object whole. Kept(R): the replica the commit then holds, the
+\* read itself with tail reads; without, the live object as replayed for
+\* any reader.
+LoopViews(s) == IF TailReads THEN TailViews(s.base, s.cur, s.txn.id) ELSE {LiveOf(s)}
+Kept(R) == IF TailReads THEN R ELSE LiveR
+
+\* The view a read through a write returns (AtomicFileLog.readThrough, D20):
+\* a replace says what the object holds, the checkpoint and records it wrote;
+\* so does an append from a tail whose bytes the writer read or wrote (not
+\* stale), whose view is the replica it holds and then its record, which the
+\* runtime folds onto that replica. After a probe (stale) the bytes before
+\* the tail are unknown, and the version written is read back. With
+\* "d20stale", an append after a probe is answered from the write too, on the
+\* replica the writer holds. A replace lands an object of one segment, an
+\* append one of more (Land).
+WroteCas(s) == s.written.segs = 1
+FromWrite(s) == WroteCas(s) \/ ~s.stale \/ Has("d20stale")
+OwnFold(s) ==
+  LET B == s.base
+      a == Fold([Acc(B.st, B, s.txn.id) EXCEPT !.out = B.out], << s.txn >>)
+  IN [st |-> a.st, C |-> a.C, H |-> a.H, F |-> a.F, P |-> a.P, err |-> a.err, out |-> a.out,
+      cnt |-> B.cnt + 1, gen |-> s.written.gen, len |-> B.len + 1, rf |-> a.rf, inc |-> B.inc]
+WrittenView(s) ==
+  IF FromWrite(s) /\ ~WroteCas(s) THEN OwnFold(s) ELSE ReplayOf(s.written, s.txn.id)
 
 -----------------------------------------------------------------------------
 (* Writes *)
@@ -270,6 +296,8 @@ Idle(k, n) ==
    lr |-> None, cre |-> FALSE, cv |-> None, cp |-> << >>, crs |-> 0, cc |-> << >>]
 \* pc: idle, staged, loop, cas, throttled, readback, rebase, refresh, shrink,
 \*   resolve, restage, compact, compactread.
+\* A restaging operation (restage) keeps the replica its failed commit held,
+\*   base and cur, which its fresh read continues (Restage).
 \* rt: the times the operation was restaged; nw: its write requests; pay:
 \*   with Paging, the CAS payload fixed when its pages were put (PrepCas).
 \* lr: the replica the commit's record landed in, which its compaction
@@ -340,7 +368,8 @@ OracleAtEnd(w, s, out, final) == TRUE
 End(w, s, out, landed) ==
   LET final == ~(out = "failed" /\ Shapes[w][s.k].retry /\ s.rt < ClientRetries)
       again == [Idle(s.k, s.n + 1) EXCEPT !.pc = "restage", !.rt = s.rt + 1, !.nw = s.nw,
-                                          !.first = s.first, !.ocf = s.ocf]
+                                          !.first = s.first, !.ocf = s.ocf,
+                                          !.base = s.base, !.cur = s.cur]
   IN
   /\ ended' = ended \cup {[id |-> s.txn.id, out |-> out, cf |-> s.cf, cx |-> s.cx,
                            ci |-> s.ci, pf |-> s.pf, judged |-> s.lr # None,
@@ -518,7 +547,9 @@ BeginNested(w) ==
   /\ UNCHANGED PageVars
 
 \* FileIOCatalog restages an operation whose commit failed on a fresh read
-\* (commitOnAFreshRead; Iceberg's table commit retries likewise).
+\* (commitOnAFreshRead; Iceberg's table commit retries likewise): with tail
+\* reads, of what follows the replica the failed commit held.
+RestageViews(s) == IF TailReads /\ s.base # None THEN TailViews(s.base, s.cur, None) ELSE {LiveR}
 Restage(w, fk) ==
   LET s == ws[w] IN
   /\ CanStep(w) /\ s.pc = "restage"
@@ -526,10 +557,10 @@ Restage(w, fk) ==
   /\ UseFault(fk)
   /\ UNCHANGED <<file, inflight, now>>
   /\ UNCHANGED PageVars
-  /\ IF fk = "readFail" \/ LiveR.err
-       THEN End(w, [s EXCEPT !.txn = [id |-> None], !.cf = TRUE, !.ocf = TRUE], "error", FALSE)
-     ELSE Go(w, [Staged(s, LiveR, Stage(w, Shapes[w][s.k], LiveR, s.n)) EXCEPT !.pc = "loop"],
-             FALSE)
+  /\ \E R \in RestageViews(s) :
+       IF fk = "readFail" \/ R.err
+         THEN End(w, [s EXCEPT !.txn = [id |-> None], !.cf = TRUE, !.ocf = TRUE], "error", FALSE)
+       ELSE Go(w, [Staged(s, R, Stage(w, Shapes[w][s.k], R, s.n)) EXCEPT !.pc = "loop"], FALSE)
 
 \* A replace or an append through LogRuntime's write: one request.
 \* Faults: failBefore (an IOException before landing), lostReply (landed,
@@ -578,30 +609,31 @@ Write(w, fk) ==
                ELSE IF Has("25") THEN End(w, s1, "failed", lands)
                ELSE Ambig(w, s1, lands)
 
-\* write reads back the version it wrote (readThrough); validate judges it. A
-\* failed read, or (strict) one of a version replaced since, is ambiguous.
+\* write reads through the version it wrote (readThrough); validate judges it.
+\* A view the write left (FromWrite) needs no request; a read back that fails,
+\* or (strict) one of a version replaced since, is ambiguous.
 ReadBack(w, fk) ==
   LET s == ws[w]
-      R == ReplayOf(s.written, s.txn.id)
+      R == WrittenView(s)
       s1 == [Faulted(s, fk) EXCEPT !.written = None]
   IN /\ CanStep(w) /\ s.pc = "readback"
      /\ fk \in RFaultsOf(w)
+     /\ fk = "readFail" => ~FromWrite(s)
      /\ fk = "pageFail" => NeedsPage(R, s.txn.id)
      /\ UseFault(fk)
      /\ UNCHANGED <<file, inflight, now>>
      /\ UNCHANGED PageVars
-     /\ IF fk = "readFail" \/ (Strict /\ file.gen # s.written.gen) \/ R.err
+     /\ IF fk = "readFail" \/ (~FromWrite(s) /\ Strict /\ file.gen # s.written.gen) \/ R.err
           THEN Ambig(w, s1, FALSE)
           ELSE Judge(w, [s1 EXCEPT !.cx = @ \/ Crossed(R, s.txn)], R, fk = "pageFail", TRUE,
                      End(w, s1, "failed", FALSE))   \* replay rejected the record: conflict
 
-\* A read of the live catalog by a commit, then `then(R)`; a failure is
-\* Unreadable. pageFail: the read succeeds, and the get of the page
-\* landed() asks fails.
-ReadLive(w, fk, s, pcs) ==
+\* A read R of the catalog by a commit; a failure is Unreadable. pageFail:
+\* the read succeeds, and the get of the page landed() asks fails.
+ReadLive(w, fk, s, pcs, R) ==
   /\ CanStep(w) /\ s.pc \in pcs
   /\ fk \in RFaultsOf(w)
-  /\ fk = "pageFail" => s.pc # "refresh" /\ NeedsPage(LiveOf(s), s.txn.id)
+  /\ fk = "pageFail" => s.pc # "refresh" /\ NeedsPage(R, s.txn.id)
   /\ UseFault(fk)
   /\ UNCHANGED <<file, inflight, now>>
   /\ UNCHANGED PageVars
@@ -609,14 +641,16 @@ ReadLive(w, fk, s, pcs) ==
 \* After a CAS conflict: rebase on a fresh read if the transaction still
 \* holds on it, else fail without writing (conflict()).
 Rebase(w, fk) ==
-  LET s == ws[w]
-      s1 == [Faulted(s, fk) EXCEPT !.cx = @ \/ Crossed(LiveR, s.txn)]
-  IN /\ ReadLive(w, fk, s, {"rebase"})
-     /\ IF fk = "readFail" \/ LiveR.err THEN Unreadable(w, Faulted(s, fk))
-        ELSE Judge(w, s1, LiveOf(s), fk = "pageFail", FALSE,
-               IF Verify(LiveR.st, s.txn)
-                 THEN Go(w, [Rebased(s1, LiveR) EXCEPT !.att = @ + 1, !.pc = "loop"], FALSE)
-                 ELSE End(w, [s1 EXCEPT !.unres = FALSE], "failed", FALSE))
+  LET s == ws[w] IN
+  /\ s.pc = "rebase"
+  /\ \E R \in LoopViews(s) :
+       LET s1 == [Faulted(s, fk) EXCEPT !.cx = @ \/ Crossed(R, s.txn)] IN
+       /\ ReadLive(w, fk, s, {"rebase"}, R)
+       /\ IF fk = "readFail" \/ R.err THEN Unreadable(w, Faulted(s, fk))
+          ELSE Judge(w, s1, R, fk = "pageFail", FALSE,
+                 IF Verify(R.st, s.txn)
+                   THEN Go(w, [Rebased(s1, Kept(R)) EXCEPT !.att = @ + 1, !.pc = "loop"], FALSE)
+                   ELSE End(w, [s1 EXCEPT !.unres = FALSE], "failed", FALSE))
 
 \* After an append lost its race, without tail reads: a metadata request for
 \* the new length. Shrank (compacted): re-read. Grew: retry the same record
@@ -628,7 +662,7 @@ Refresh(w, fk) ==
       s1 == Faulted(s, fk)
       cur2 == [gen |-> file.gen, len |-> FileLen(file),
                inc |-> IF Has("probeinc") THEN s.cur.inc ELSE file.inc]
-  IN /\ ReadLive(w, fk, s, {"refresh"})
+  IN /\ ReadLive(w, fk, s, {"refresh"}, LiveOf(s))
      /\ IF fk = "readFail" THEN Unreadable(w, s1)
         ELSE IF FileLen(file) < s.cur.len
           THEN Go(w, [s1 EXCEPT !.cur = cur2, !.pc = "shrink"], FALSE)
@@ -641,19 +675,19 @@ Refresh(w, fk) ==
 \* read's would.
 TailRead(w, fk) ==
   LET s == ws[w] IN
-  /\ ReadLive(w, fk, s, {"tailread"})
-  /\ IF fk = "readFail" THEN Unreadable(w, Faulted(s, fk))
-     ELSE \E R \in TailViews(s.base, s.cur, s.txn.id) :
-            LET s1 == [Faulted(s, fk) EXCEPT !.cx = @ \/ Crossed(R, s.txn)] IN
-            IF R.err THEN Unreadable(w, Faulted(s, fk))
-            ELSE Judge(w, s1, R, fk = "pageFail", FALSE,
-                   Go(w, [Rebased(s1, R) EXCEPT !.att = @ + 1, !.pc = "loop"], FALSE))
+  /\ s.pc = "tailread"
+  /\ \E R \in TailViews(s.base, s.cur, s.txn.id) :
+       LET s1 == [Faulted(s, fk) EXCEPT !.cx = @ \/ Crossed(R, s.txn)] IN
+       /\ ReadLive(w, fk, s, {"tailread"}, R)
+       /\ IF fk = "readFail" \/ R.err THEN Unreadable(w, Faulted(s, fk))
+          ELSE Judge(w, s1, R, fk = "pageFail", FALSE,
+                 Go(w, [Rebased(s1, R) EXCEPT !.att = @ + 1, !.pc = "loop"], FALSE))
 
 \* The file shrank: read it afresh.
 Shrink(w, fk) ==
   LET s == ws[w]
       s1 == [Faulted(s, fk) EXCEPT !.cx = @ \/ Crossed(LiveR, s.txn)]
-  IN /\ ReadLive(w, fk, s, {"shrink"})
+  IN /\ ReadLive(w, fk, s, {"shrink"}, LiveOf(s))
      /\ IF fk = "readFail" \/ LiveR.err THEN Unreadable(w, Faulted(s, fk))
         ELSE Judge(w, s1, LiveOf(s), fk = "pageFail", FALSE,
                Go(w, [Rebased(s1, LiveR) EXCEPT !.att = @ + 1, !.pc = "loop"], FALSE))
@@ -663,27 +697,30 @@ Shrink(w, fk) ==
 \* strict storage refuses once replaced. With Bug 12 there was no read (see
 \* NextWrite).
 FreshForCAS(w, fk) ==
-  LET s == ws[w]
-      s1 == [Faulted(s, fk) EXCEPT !.cx = @ \/ Crossed(LiveR, s.txn)]
-  IN /\ s.pc = "loop" /\ s.att < MaxAttempts /\ MustCAS(s) /\ s.stale /\ ~Has("12")
-     /\ ReadLive(w, fk, s, {"loop"})
-     /\ IF fk = "readFail" \/ LiveR.err \/ (Has("26") /\ Strict /\ file.gen # s.cur.gen)
-          THEN Unreadable(w, Faulted(s, fk))
-        ELSE Judge(w, s1, LiveOf(s), fk = "pageFail", FALSE,
-                   Go(w, [Rebased(s1, LiveR) EXCEPT !.pc = "cas"], FALSE))
+  LET s == ws[w] IN
+  /\ s.pc = "loop" /\ s.att < MaxAttempts /\ MustCAS(s) /\ s.stale /\ ~Has("12")
+  /\ \E R \in LoopViews(s) :
+       LET s1 == [Faulted(s, fk) EXCEPT !.cx = @ \/ Crossed(R, s.txn)] IN
+       /\ ReadLive(w, fk, s, {"loop"}, R)
+       /\ IF fk = "readFail" \/ R.err \/ (Has("26") /\ Strict /\ file.gen # s.cur.gen)
+            THEN Unreadable(w, Faulted(s, fk))
+          ELSE Judge(w, s1, R, fk = "pageFail", FALSE,
+                     Go(w, [Rebased(s1, Kept(R)) EXCEPT !.pc = "cas"], FALSE))
 
 \* catch (AmbiguousWrite): a fresh read decides. If the record is not there,
 \* retry on that read if the transaction holds on it, else fail. A failed
 \* read leaves the outcome unknown.
 Resolve(w, fk) ==
-  LET s == ws[w]
-      s1 == [Faulted(s, fk) EXCEPT !.cx = @ \/ Crossed(LiveR, s.txn)]
-  IN /\ ReadLive(w, fk, s, {"resolve"})
-     /\ IF fk = "readFail" \/ LiveR.err THEN Unreadable(w, Faulted(s, fk))
-        ELSE Judge(w, s1, LiveOf(s), fk = "pageFail", FALSE,
-               IF Verify(LiveR.st, s.txn)
-                 THEN Go(w, [Rebased(s1, LiveR) EXCEPT !.att = @ + 1, !.pc = "loop"], FALSE)
-                 ELSE End(w, [s1 EXCEPT !.unres = FALSE], "failed", FALSE))
+  LET s == ws[w] IN
+  /\ s.pc = "resolve"
+  /\ \E R \in LoopViews(s) :
+       LET s1 == [Faulted(s, fk) EXCEPT !.cx = @ \/ Crossed(R, s.txn)] IN
+       /\ ReadLive(w, fk, s, {"resolve"}, R)
+       /\ IF fk = "readFail" \/ R.err THEN Unreadable(w, Faulted(s, fk))
+          ELSE Judge(w, s1, R, fk = "pageFail", FALSE,
+                 IF Verify(R.st, s.txn)
+                   THEN Go(w, [Rebased(s1, Kept(R)) EXCEPT !.att = @ + 1, !.pc = "loop"], FALSE)
+                   ELSE End(w, [s1 EXCEPT !.unres = FALSE], "failed", FALSE))
 
 \* Out of attempts: unknown after an ambiguous write; failed, unless the last
 \* append lost a race to its own landing, which a final read decides.
@@ -696,13 +733,14 @@ Exhaust(w) ==
   /\ End(w, [s EXCEPT !.ex = TRUE], IF s.amb THEN "unknown" ELSE "failed", FALSE)
 
 FinalRead(w, fk) ==
-  LET s == ws[w]
-      s1 == [Faulted(s, fk) EXCEPT !.cx = @ \/ Crossed(LiveR, s.txn)]
-  IN /\ s.pc = "loop" /\ s.att >= MaxAttempts /\ ~s.amb /\ s.unres
-     /\ ReadLive(w, fk, s, {"loop"})
-     /\ IF fk = "readFail" \/ LiveR.err THEN Unreadable(w, Faulted(s, fk))
-        ELSE Judge(w, s1, LiveOf(s), fk = "pageFail", FALSE,
-                   End(w, [s1 EXCEPT !.ex = TRUE], "failed", FALSE))
+  LET s == ws[w] IN
+  /\ s.pc = "loop" /\ s.att >= MaxAttempts /\ ~s.amb /\ s.unres
+  /\ \E R \in LoopViews(s) :
+       LET s1 == [Faulted(s, fk) EXCEPT !.cx = @ \/ Crossed(R, s.txn)] IN
+       /\ ReadLive(w, fk, s, {"loop"}, R)
+       /\ IF fk = "readFail" \/ R.err THEN Unreadable(w, Faulted(s, fk))
+          ELSE Judge(w, s1, R, fk = "pageFail", FALSE,
+                     End(w, [s1 EXCEPT !.ex = TRUE], "failed", FALSE))
 
 \* With CompactAfter, the compaction of the replica the commit's record
 \* landed in: one conditional replace of that version (with Paging, its pages
@@ -874,8 +912,12 @@ Init ==
   /\ store = {}
   /\ nsw = 0
   /\ spages = {}
+  /\ versions = {Ck(Replay(InitFile))}
 
-WriterNext(w) ==
+\* The history: each version the object takes, replayed.
+Record == versions' = IF file' = file THEN versions ELSE versions \cup {Ck(Replay(file'))}
+
+WriterStep(w) ==
   \/ Begin(w)
   \/ Start(w)
   \/ BeginNested(w)
@@ -888,12 +930,13 @@ WriterNext(w) ==
   \/ \E fk \in ReadFaults \cup {"none"} : CompactRead(w, fk)
   \/ \E fk \in PutFaults \cup {"none"} : PrepCas(w, fk)
   \/ SweepState(w)
+WriterNext(w) == WriterStep(w) /\ Record
 
 Next ==
   \/ \E w \in Writers : WriterNext(w)
-  \/ \E i \in inflight : LandInflight(i)
-  \/ Sweep
-  \/ Tick
+  \/ \E i \in inflight : LandInflight(i) /\ Record
+  \/ Sweep /\ UNCHANGED versions
+  \/ Tick /\ UNCHANGED versions
   \/ Done
 
 Spec == Init /\ [][Next]_vars
@@ -911,9 +954,13 @@ Hist == LiveR.st.hist
 \* object (format 3; "probeinc" and "lengthonly" frame one with another's).
 Readable == ~LiveR.err /\ FramesTrue
 
-\* No writer holds a replica of a state the object never held: a torn read
-\* ("notrailer") or a fold of another incarnation's records ("lengthonly").
-NoUnheldState == \A w \in Writers : ws[w].base # None => ws[w].base.held
+\* No writer holds a replica of a state the object never held (the replicas
+\* it reads, rebases on, and lands its record in): a torn read ("notrailer"),
+\* a fold of another incarnation's records ("lengthonly"), or a read through an
+\* append after a probe answered from the write ("d20stale").
+NoUnheldState ==
+  \A w \in Writers : /\ ws[w].base # None => Ck(ws[w].base) \in versions
+                     /\ ws[w].lr # None => Ck(ws[w].lr) \in versions
 
 \* No transaction applies twice.
 ExactlyOnce == \A i, j \in 1..Len(Hist) : i # j => Hist[i].id # Hist[j].id

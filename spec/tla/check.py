@@ -184,6 +184,13 @@ CONFIGS = {
                    "Bugs": '{"notrailer"}'}, {"NoUnheldState"}),
     "probeinc": ({"Retention": "0", "MaxTime": "2", "Shapes": "<- TwoEach", "MaxCount": "1",
                   "TailReads": "FALSE", "Bugs": '{"probeinc"}'}, {"Readable"}),
+    # The 2026-11-17 review's F2: a read through an append after a probe answered from the write
+    # (D20) as if the writer's replica were the version its condition named: its view misses the
+    # records that beat the first send. Probe path (tail reads off), with compaction after the
+    # commit, whose checkpoint would erase them.
+    "d20stale": ({**AFTER, "Shapes": "<- TwoEach", "Retention": "0", "MaxTime": "2",
+                  "TailReads": "FALSE", "Bugs": '{"d20stale"}'},
+                 {"NoUnheldState", "HistGrows", "CheckpointIsReplay", "HonestCommitted"}),
     # Calibration: each bug, put back, must break a property. Bugs 26, 64a and floorgap need a
     # resend after a probe, without a read (TailReads FALSE): with tail reads the loop reads, and
     # judges the record, before it resends.
