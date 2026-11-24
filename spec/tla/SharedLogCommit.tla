@@ -27,6 +27,12 @@
 (* nothing landed, and the writer knows it. Writers' catalogs also read    *)
 (* the log outside a commit (Look), never going back past what they read   *)
 (* or committed in (Bug 72).                                               *)
+(*                                                                         *)
+(* With SealEvery, the state pages part of itself (SNAPSHOT_PAGING.md): a  *)
+(* compactor puts the pages its checkpoint names that the records after    *)
+(* the checkpoint it read from sealed, before storing it, and deletes the  *)
+(* pages they dropped once it is stored; sweeps delete the pages garbage   *)
+(* under any read, however stale.                                          *)
 (***************************************************************************)
 EXTENDS RSM, TLC
 
@@ -68,7 +74,8 @@ ASSUME /\ FaultKinds \subseteq WriteFaults \cup ReadFaults \cup PutFaults
                           "missingfail", "nojoint",
                           "viewnotable", "tablenoview", "viewdropnoremovals", "viewnobump", "viewstale",
                           "absentonly", "noabsence", "dropnobump", "renamenobump",
-                          "voidunres", "voidlands", "lagsettle", "readsgoback"}
+                          "voidunres", "voidlands", "lagsettle", "readsgoback",
+                          "rootfirst", "sweepnewest", "sweepstale"}
 
 VARIABLES
   log,       \* every record appended, in order (the trimmed ones too)
@@ -85,10 +92,13 @@ VARIABLES
   ook,       \* every oracle check so far passed (SharedLogOracles)
   store,     \* the page store: the names of the pages in it
   pend,      \* PageOuts whose pages were put, not yet sent (one never sent: a crash)
-  looks      \* Writers -> what the writer's catalog read outside a commit (see Look)
+  looks,     \* Writers -> what the writer's catalog read outside a commit (see Look)
+  spages,    \* the state's pages stored (SNAPSHOT_PAGING.md): [e, v] names
+  nk         \* with "sweepnewest", the checkpoint stored last
 
-vars == <<log, ckpts, trimmed, inflight, now, nf, comp, ws, ended, ook, store, pend, looks>>
-PageVars == <<store, pend>>
+vars == <<log, ckpts, trimmed, inflight, now, nf, comp, ws, ended, ook, store, pend, looks,
+          spages, nk>>
+PageVars == <<store, pend, spages, nk>>
 
 -----------------------------------------------------------------------------
 (* Reads *)
@@ -440,19 +450,27 @@ AppendGc(sk) ==
 \* again; with "nojoint" it checkpoints the gapped replay). With "ckclock", the
 \* checkpoint drops the ids its compactor's clock says are past the retention,
 \* as the file's checkpoint did before GC records: no record says so.
+\* The state's pages: its compactor first puts those the records after c
+\* sealed (StateMachine.pages: a state decoded from a checkpoint names only
+\* pages that exist), and once it is stored deletes those they dropped
+\* (droppedPages: a page dropped never comes back). With "rootfirst", the
+\* checkpoint is stored without its pages (its compactor died between).
 PutCheckpoint(p, c, sk, gap) ==
   LET R == ReadFromGap(c, p, None, gap)
       g == IF Has("ckclock") /\ Retention >= 0 THEN Gc(R, Max(0, 1 + now + sk - Retention))
            ELSE R
+      ck == [pos |-> p, st |-> g.st, C |-> g.C, H |-> g.H, F |-> g.F, P |-> g.P]
+      put == IF Has("rootfirst") THEN {} ELSE g.st.sealed \ c.st.sealed
   IN /\ comp.ck < MaxCkpt
      /\ c \in Usable /\ c.pos < p /\ p <= Len(log)
      /\ gap \in Gaps(c, p)
      /\ \A d \in ckpts : d.pos # p
-     /\ ckpts' = ckpts \cup {[pos |-> p, st |-> g.st, C |-> g.C, H |-> g.H, F |-> g.F,
-                             P |-> g.P]}
+     /\ ckpts' = ckpts \cup {ck}
      /\ comp' = [comp EXCEPT !.ck = @ + 1]
+     /\ spages' = (spages \cup put) \ (c.st.sealed \ g.st.sealed)
+     /\ nk' = IF Has("sweepnewest") THEN ck ELSE nk
      /\ UNCHANGED <<log, trimmed, inflight, now, nf, ws, ended, ook, looks>>
-     /\ UNCHANGED PageVars
+     /\ UNCHANGED <<store, pend>>
 
 \* trim(p): only through records a stored checkpoint covers (P5); with
 \* "trimearly", before one does.
@@ -480,7 +498,7 @@ PutPage(c, q, sk, fk) ==
   /\ store' = IF fk = "putFail" THEN store ELSE store \cup {PoOf(R.C)}
   /\ pend' = IF fk = "none" THEN pend \cup {PoOf(R.C)} ELSE pend
   /\ comp' = [comp EXCEPT !.pg = @ + 1]
-  /\ UNCHANGED <<log, ckpts, trimmed, inflight, now, ws, ended, ook, looks>>
+  /\ UNCHANGED <<log, ckpts, trimmed, inflight, now, ws, ended, ook, looks, spages, nk>>
 
 \* The PageOut lands, after its page was put. Replay applies it only if its
 \* block is unchanged where it lands. A compactor that crashes after the put
@@ -490,7 +508,7 @@ SendPageOut(po) ==
   /\ log' = Append(log, po)
   /\ pend' = pend \ {po}
   /\ ws' = [v \in Writers |-> IF ws[v].pc # "idle" THEN [ws[v] EXCEPT !.ci = TRUE] ELSE ws[v]]
-  /\ UNCHANGED <<ckpts, trimmed, inflight, now, nf, comp, ended, ook, store, looks>>
+  /\ UNCHANGED <<ckpts, trimmed, inflight, now, nf, comp, ended, ook, store, looks, spages, nk>>
 
 \* A sweep lists the page store and deletes every page its read does not
 \* reference whose node ends at or below its floor: no PageOut can name it
@@ -504,7 +522,26 @@ Sweep(c, q) ==
   IN /\ comp.sw < MaxSweep /\ del # {}
      /\ store' = store \ del
      /\ comp' = [comp EXCEPT !.sw = @ + 1]
-     /\ UNCHANGED <<log, ckpts, trimmed, inflight, now, nf, ws, ended, ook, pend, looks>>
+     /\ UNCHANGED <<log, ckpts, trimmed, inflight, now, nf, ws, ended, ook, pend, looks,
+                    spages, nk>>
+
+\* A sweep of the state's pages (LogRuntime.sweep, StateMachine.garbagePages)
+\* from any read, however stale: every page sealed at a version the read has
+\* reached that it does not name (dropped since; a page sealed after the read
+\* is not garbage). With "sweepstale", every page the read does not name;
+\* with "sweepnewest", every page the checkpoint stored last does not name, as
+\* if it were the one checkpoint readers start from (compactors may store a
+\* checkpoint behind another).
+SweepState(c, q) ==
+  LET R == ReadFrom(c, q, None)
+      del == CASE Has("sweepnewest") -> {pg \in spages : pg \notin nk.st.sealed}
+               [] Has("sweepstale") -> {pg \in spages : pg \notin R.st.sealed}
+               [] OTHER -> {pg \in spages : pg \notin R.st.sealed /\ pg.v <= R.st.ver[pg.e]}
+  IN /\ SealEvery > 0 /\ comp.sw < MaxSweep /\ del # {}
+     /\ spages' = spages \ del
+     /\ comp' = [comp EXCEPT !.sw = @ + 1]
+     /\ UNCHANGED <<log, ckpts, trimmed, inflight, now, nf, ws, ended, ook, store, pend, looks,
+                    nk>>
 
 -----------------------------------------------------------------------------
 (* Reads outside a commit: LogRuntime.read(floor) and refresh *)
@@ -551,6 +588,8 @@ Init ==
   /\ store = {}
   /\ pend = {}
   /\ looks = [w \in Writers |-> [sn |-> 0, hs |-> 0, ok |-> TRUE, fl |-> FALSE, n |-> 0]]
+  /\ spages = {}
+  /\ nk = InitCk
 
 WriterNext(w) ==
   \/ Begin(w)
@@ -567,6 +606,7 @@ CompactorNext ==
        \E q \in Ends(c) : PutPage(c, q, sk, fk)
   \/ \E po \in pend : SendPageOut(po)
   \/ \E c \in Usable : \E q \in Ends(c) : Sweep(c, q)
+  \/ \E c \in Usable : \E q \in Ends(c) : SweepState(c, q)
 
 Next ==
   \/ \E w \in Writers : WriterNext(w)
@@ -649,9 +689,16 @@ HistGrows ==
        /\ Len(h2) >= Len(Hist) /\ SubSeq(h2, 1, Len(Hist)) = Hist
        /\ Len(h2) <= Len(Hist) + 1]_log
 
+\* The state's pages (SNAPSHOT_PAGING.md "Testing"): every page a checkpoint a
+\* reader may start from names, and the log still names, is in the store. A
+\* page the records after a checkpoint dropped is garbage once they are in
+\* the log: a reader replays them before it loads (one whose read lags reads
+\* again when it finds a page missing).
+StatePagesExist == \A c \in Usable : \A pg \in c.st.sealed \cap Full.st.sealed : pg \in spages
+
 Safety ==
   Readable /\ Deterministic /\ CheckpointIsReplay /\ ExactlyOnce /\ Serializable
     /\ UniqueIds /\ HonestCommitted /\ HonestFailed /\ UnknownExplained
-    /\ PagesExist /\ PagesExact
+    /\ PagesExist /\ PagesExact /\ StatePagesExist
 
 =============================================================================

@@ -862,15 +862,16 @@ PrepCas(w, fk) ==
 StateGarbage(a) ==
   {p \in spages : p \notin a.st.sealed /\ (Has("sweepstale") \/ p.v <= a.st.ver[p.e])}
 
-\* A sweep of the state's pages from a writer's view, however stale (its
-\* snapshot): LogRuntime.sweep(replica).
+\* A sweep of the state's pages from a replica a writer holds, however stale
+\* (the snapshot it staged on, the replica it holds, the one its record
+\* landed in): LogRuntime.sweep(replica).
 SweepState(w) ==
-  LET a == ws[w].snap
-      del == IF a = None THEN {} ELSE StateGarbage(a)
-  IN /\ SealEvery > 0 /\ nsw < MaxSweep /\ del # {}
-     /\ spages' = spages \ del
-     /\ nsw' = nsw + 1
-     /\ UNCHANGED <<file, inflight, now, nf, ws, ended, res, ook, sched, store>>
+  \E a \in {ws[w].snap, ws[w].base, ws[w].lr} \ {None} :
+    LET del == StateGarbage(a) IN
+    /\ SealEvery > 0 /\ nsw < MaxSweep /\ del # {}
+    /\ spages' = spages \ del
+    /\ nsw' = nsw + 1
+    /\ UNCHANGED <<file, inflight, now, nf, ws, ended, res, ook, sched, store>>
 
 \* A sweep (any compactor, LogRuntime.sweep(replica)) lists the page store and
 \* deletes every page the replica R it sweeps from does not reference whose

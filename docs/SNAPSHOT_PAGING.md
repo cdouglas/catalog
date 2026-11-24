@@ -426,8 +426,12 @@ committed set's orphans (COMMITTED_PAGING.md, "Orphans"), a delete per page.
 An operator schedules it (daily, say, and after a writer crashed or a store
 failed deletes); nothing in the catalog calls it.
 
-- On a shared log with checkpoints apart, the sweep counts every checkpoint
-  the provider may still serve, not only the newest.
+- On a shared log with checkpoints apart, a reader may start from any
+  checkpoint the provider still serves, and replays the records after it
+  before it loads: a page those records dropped is garbage for it too, so
+  the sweep needs no list of checkpoints (spec/tla `SharedLogCommit.tla`'s
+  `StatePagesExist`; its switch `sweepnewest`, a sweep of what the
+  checkpoint stored last does not name, breaks it).
 - A reader holding metadata from before a block emptied, or from before its
   table was evicted, reads the snapshots it held from the table as it is
   now, less those expired since. That is a REST catalog's lazy load: its

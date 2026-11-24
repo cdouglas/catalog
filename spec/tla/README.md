@@ -185,8 +185,8 @@ goes in a replace, `oversized` in `mustReplace`: Bug 71, covered by
 
 ## Results
 
-Every configuration of the correct protocol passes. `check.py` holds 215
-configurations (125 of the file model, 66 `log-*`, 24 `sg-*`), 138 of them
+Every configuration of the correct protocol passes. `check.py` holds 225
+configurations (129 of the file model, 72 `log-*`, 24 `sg-*`), 144 of them
 expected to pass; the rest are bug switches, each expected to break a
 property. The state counts in this file's tables are from `check.py`'s full
 run at 4c685a3 (2026-11-11: the 138 configurations it held then, about six
@@ -910,8 +910,8 @@ writes.
 
 `docs/SNAPSHOT_PAGING.md` step 4 pages a table's old snapshots out of the root:
 the state machine itself names pages, which a compactor puts before the root
-that names them. The file model has them (the shared-log model does not:
-`SealEvery` is 0 in every `log-*` configuration).
+that names them. Both models have them (the shared-log model since the
+2026-11-17 review's F5; `SealEvery` is 0 in its other `log-*` configurations).
 
 - **The state** (`RSM.tla`) holds `sealed`, the names of its pages: `[e, v]`,
   entity `e`'s history sealed at its version `v`. A record that moves `e` to a
@@ -922,9 +922,10 @@ that names them. The file model has them (the shared-log model does not:
   (`LogRuntime.checkpoint`). A page a record seals after the root is pending:
   the next root's compactor puts it. Put faults touch only the committed set's
   pages here; the Java fails the checkpoint on a failed state put.
-- **Sweeps.** `SweepState(w)` deletes from writer `w`'s snapshot, however
-  stale, the pages garbage under it (`CatalogStateMachine.garbagePages`):
-  sealed at a version it has reached and not named by it.
+- **Sweeps.** `SweepState(w)` deletes the pages garbage under a replica writer
+  `w` holds, however stale (the snapshot it staged on, the replica it holds,
+  the one its record landed in): `CatalogStateMachine.garbagePages`, sealed at
+  a version the replica has reached and not named by it.
 - **`StatePagesExist`**: every page the root names that the catalog still
   names is in the store. A page a record after the root dropped is garbage
   once that record is in the log: a reader replays it before it loads (one
@@ -937,8 +938,31 @@ that names them. The file model has them (the shared-log model does not:
 | Configuration | Expect | What |
 |---|---|---|
 | `statepages` | pass | writer 1 writes `a` three times (`SealEvery` 1: seals at each version, drops one behind), CAS every commit, sweeps |
+| `statepages-faults` | pass | with a fault of any kind and strict reads: a CAS in flight, whose root names pages its `PrepCas` put, may land after a sweep |
+| `statepages-two` | pass | two transactions each (`TwoEach`): both entities' pages, swept from any replica a writer holds |
+| `after-statepages`, `after-statepages-resend` | pass | compaction after the commit, and a compaction sent again (its pages put once) |
 | `rootfirst` | `StatePagesExist` | a root written before its pages are put |
 | `sweepstale` | `StatePagesExist` | a sweep that deletes every page its (stale) view does not name, whatever version |
+
+**The shared-log model.** A compactor's `PutCheckpoint` first puts the pages
+its checkpoint names that the records after the checkpoint it read from
+sealed (`StateMachine.pages`: a state decoded from a checkpoint names only
+pages that exist), and once the checkpoint is stored deletes the pages those
+records dropped (`droppedPages`). `SweepState(c, q)` sweeps from any read,
+from any usable checkpoint and, with `Lag`, through any position.
+`StatePagesExist` asks that every page a usable checkpoint names, and the log
+still names, be in the store: a reader replays the records after its
+checkpoint before it loads (and one whose read lags reads again when it finds
+a page missing, as `LogCatalog`'s loads do).
+
+| Configuration | Expect | What |
+|---|---|---|
+| `log-statepages` | pass | writer 1 takes `a` to version 4 (`Long`), writer 2 writes `b`; two checkpoints, a trim, a sweep |
+| `log-statepages-lag` | pass | reads, checkpoints and sweeps through any position (`Lag`) |
+| `log-statepages-faults` | pass | one checkpoint, a fault of any kind |
+| `log-rootfirst` | `StatePagesExist` | a checkpoint stored without its pages |
+| `log-sweepnewest` | `StatePagesExist` | a sweep of every page the checkpoint stored last does not name, as if readers started from it alone: compactors may store a checkpoint behind another |
+| `log-sweepstale` | `StatePagesExist` | a sweep of every page a stale (lagging) read does not name, whatever version |
 
 ## Tail reads
 

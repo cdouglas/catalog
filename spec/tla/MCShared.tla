@@ -44,6 +44,12 @@ TwoEach == [w \in {1, 2} |->
               IF w = 1 THEN << T({"a"}, {"a"}), T({"b"}, {"b"}) >>
               ELSE << T({"a", "b"}, {"b"}), T({"a"}, {"a"}) >>]
 
+\* Writer 1 takes "a" through three versions (with SealEvery 1, a page sealed
+\* at each and every other one dropped), writer 2 writes "b".
+Long == [w \in {1, 2} |->
+           IF w = 1 THEN << T({"a"}, {"a"}), T({"a"}, {"a"}), T({"a"}, {"a"}) >>
+           ELSE << T({"b"}, {"b"}) >>]
+
 \* Each writes what the other reads, and not what it reads itself: a copy
 \* of a record that applied would apply again but for its id (write skew,
 \* too).

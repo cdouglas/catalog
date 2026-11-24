@@ -283,6 +283,8 @@ CONFIGS = {
                            "Strict": "TRUE"}, "pass"),
     "after-page-skew": ({**FPAGE, **AFTER, "Skew": "<- Behind2"}, "pass"),
     "after-statepages": ({**SPAGE, **AFTER}, "pass"),
+    # The 2026-11-17 review's F5: a compaction sent again (its pages put once, its root later).
+    "after-statepages-resend": ({**SPAGE, **AFTER, "CompactResends": "2"}, "pass"),
     # Resends: twice, on two and three writers, with faults, GC, a skewed clock and paging.
     "after-resend": ({**AFTER, "Shapes": "<- TwoEach", "CompactResends": "2"}, "pass"),
     "after-resend-three": ({**AFTER, "Writers": "{1, 2, 3}", "Shapes": "<- Three",
@@ -364,6 +366,12 @@ CONFIGS = {
     # The state's pages (SNAPSHOT_PAGING.md "Testing"): an entity's history seals into a page
     # at each version and drops one behind (SealEvery 1); writer 1 writes "a" three times.
     "statepages": (SPAGE, "pass"),
+    # The 2026-11-17 review's F5: with faults (a CAS in flight, whose root names pages its
+    # PrepCas put, landing after a sweep), and two transactions each (sweeps of both entities'
+    # pages, from any replica a writer holds).
+    "statepages-faults": ({**SPAGE, "MaxFaults": "1", "FaultKinds": ALL_FAULTS, "Strict": "TRUE"},
+                          "pass"),
+    "statepages-two": ({**SPAGE, "Shapes": "<- TwoEach"}, "pass"),
     # A root written before its pages are put.
     "rootfirst": ({**SPAGE, "Bugs": '{"rootfirst"}'}, {"StatePagesExist"}),
     # A sweep from a stale view that deletes every page it does not name, whatever version.
@@ -402,7 +410,8 @@ LOG_BASE = {
 LOG_SAFETY = ["StampsCount", "Readable", "Deterministic", "CheckpointIsReplay", "ExactlyOnce",
               "Serializable",
               "UniqueIds", "WellNamed", "HonestCommitted", "HonestFailed", "UnknownExplained",
-              "SoloCommits", "PagesExist", "PagesExact", "Shape", "OnGrid", "MonotoneReads"]
+              "SoloCommits", "PagesExist", "PagesExact", "Shape", "OnGrid", "MonotoneReads",
+              "StatePagesExist"]
 LOG_ACTIONS = ["HistGrows"]
 
 LOG_FAULTS = ('{"failBefore", "notSent", "lostReply", "throttled", "landedThrottled", '
@@ -413,6 +422,10 @@ COMPACT1 = {**COMPACT, "MaxCkpt": "1"}
 # Paging (COMMITTED_PAGING.md): a tick, so that ids land in two blocks; a page put (then its
 # PageOut sent, or never: a crash) and a sweep; A = 0, N = 1, stamps on a grid of 8.
 PAGE = {"Shapes": "<- TwoEach", "MaxTime": "1", "MaxPage": "1", "MaxSweep": "1"}
+# The state's pages (SNAPSHOT_PAGING.md): writer 1 takes "a" to version 4 (SealEvery 1: pages
+# sealed at 2, 3 and 4, and 3 dropped), writer 2 writes "b"; two checkpoints, a trim, a sweep.
+SPAGE_LOG = {"Shapes": "<- Long", "SealEvery": "1", "MaxCkpt": "2", "MaxTrim": "1",
+             "MaxSweep": "1"}
 # One transaction each still lands two ids in two blocks (a tick between them): for the larger
 # configurations.
 PAGE1 = {"MaxTime": "1", "MaxPage": "1", "MaxSweep": "1"}
@@ -463,6 +476,23 @@ LOG_CONFIGS = {
     "log-page-faults": ({**PAGE1, "MaxCkpt": "1", "MaxFaults": "1", "FaultKinds": PAGE_FAULTS},
                         "pass"),
     "log-page-lag": ({**COMPACT1, **PAGE1, "Lag": "TRUE", "MaxPage": "2"}, "pass"),
+    # The state's pages (SNAPSHOT_PAGING.md), absent from this model before the 2026-11-17
+    # review's F5: compactors put the pages a checkpoint's records sealed before storing it, and
+    # delete those they dropped; a sweep from any read, however stale (with Lag, through any
+    # position), deletes what is garbage under it. Writer 1 takes "a" to version 4: pages
+    # sealed at 2, 3 and 4, and 3 dropped.
+    "log-statepages": ({**SPAGE_LOG}, "pass"),
+    "log-statepages-lag": ({**SPAGE_LOG, "Lag": "TRUE"}, "pass"),
+    "log-statepages-faults": ({**SPAGE_LOG, "MaxCkpt": "1", "MaxFaults": "1",
+                               "FaultKinds": LOG_FAULTS}, "pass"),
+    # Their switches: a checkpoint stored before its pages; a sweep of every page the
+    # checkpoint stored last does not name (compactors may store one behind another); a sweep of
+    # every page a stale read does not name.
+    "log-rootfirst": ({**SPAGE_LOG, "Bugs": '{"rootfirst"}'}, {"StatePagesExist"}),
+    "log-sweepnewest": ({**SPAGE_LOG, "Shapes": "<- Contend", "Bugs": '{"sweepnewest"}'},
+                        {"StatePagesExist"}),
+    "log-sweepstale": ({**SPAGE_LOG, "Lag": "TRUE", "Bugs": '{"sweepstale"}'},
+                       {"StatePagesExist"}),
     "log-page-skew": ({**COMPACT1, **PAGE1, "Retention": "1", "Skew": "<- Behind2",
                        "CompSkews": "{0, 2}"}, "pass"),
     # Calibration: each bug, put back, must break a property.
