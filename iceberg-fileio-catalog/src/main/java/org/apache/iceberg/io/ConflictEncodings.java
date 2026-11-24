@@ -111,14 +111,16 @@ final class ConflictEncodings {
         return "merge: a pointer table";
       }
       String unmergeable =
-          Landing.unmergeable(action.delta(), landing.table(), builder, action.tableId());
+          Landing.unmergeable(
+              action.delta(), landing.table(), builder, action.tableId(), action.broughtBack());
       if (unmergeable != null) {
         return "merge: " + unmergeable;
       }
     } else if (action.kind() == TableAction.Kind.DELTA && landing.inline()) {
       // its base must hold what it names by reference (a writer names only what it read there)
       String unresolved =
-          Landing.unresolved(action.delta(), landing.table(), builder, action.tableId());
+          Landing.unresolved(
+              action.delta(), landing.table(), builder, action.tableId(), action.broughtBack());
       if (unresolved != null) {
         return "unresolved: " + unresolved;
       }

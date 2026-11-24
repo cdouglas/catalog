@@ -3442,7 +3442,7 @@ public class ProtoCodec {
     TableAction table() {
       if (table == null) {
         table = deltaBytes != null
-            ? TableAction.delta(id, version, deltaBytes, pinned)
+            ? TableAction.delta(id, version, deltaBytes, pinned).bringingBack(broughtBack)
             : TableAction.of(
                 fullMetadata != null ? TableAction.Kind.FULL : TableAction.Kind.LOCATION,
                 id, version);

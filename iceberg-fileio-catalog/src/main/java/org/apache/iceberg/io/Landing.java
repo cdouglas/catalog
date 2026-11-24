@@ -204,25 +204,33 @@ final class Landing {
    * new snapshot may take its parent's extra summary entries, and name the manifests it removes by
    * their indices in its parent's list ({@code builder}'s lists of {@code tableId}): the parent its
    * writer read, which a delta on its base finds there, while a later version may have expired it.
+   * A sealed snapshot the update brings back ({@code back}) is inline where the delta applies, as
+   * {@link SnapshotSealing#reason} counts it (Bug 133 (bring-back parent read as gone)).
    */
   static String unresolved(
-      DecodedDelta delta, MetadataView table, CatalogState.Builder builder, int tableId) {
+      DecodedDelta delta, MetadataView table, CatalogState.Builder builder, int tableId,
+      List<SnapshotPages.BroughtBack> back) {
     String names = delta.unresolvedNames(builder.manifestListPrefix(tableId));
     if (names != null) {
       return names;
     }
     Map<Long, AddSnapshotUpdate> adds = adds(delta);
+    Set<Long> broughtBack = new HashSet<>();
+    for (SnapshotPages.BroughtBack brought : back) {
+      broughtBack.add(brought.snapshotId);
+    }
     for (AddSnapshotUpdate add : adds.values()) {
       if (add.inheritsParentExtra
           && (add.parentSnapshotId == null || adds.containsKey(add.parentSnapshotId)
-              || table.snapshot(add.parentSnapshotId) == null)) {
+              || (table.snapshot(add.parentSnapshotId) == null
+                  && !broughtBack.contains(add.parentSnapshotId)))) {
         return "the parent whose summary entries its snapshot takes is gone";
       }
     }
     for (DeltaUpdate update : delta.updates) {
       if (update instanceof RemoveManifestUpdate
           && ((RemoveManifestUpdate) update).parentIndices != null
-          && removed((RemoveManifestUpdate) update, adds, builder, tableId) == null) {
+          && removed((RemoveManifestUpdate) update, adds, builder, tableId, back) == null) {
         return "the parent's list whose manifests it removes by index is gone";
       }
     }
@@ -232,18 +240,43 @@ final class Landing {
   /**
    * What {@code remove} removes, matched as path ends ({@link RemoveManifestUpdate#removed}): its
    * indices name manifests of the list of its snapshot's parent as {@code adds} names it, which
-   * must be one the table holds, not one the delta adds. Null if they name what is not there.
+   * must be one the table holds, or one the update brings back ({@code back}), not one the delta
+   * adds. Null if they name what is not there.
    */
   private static List<String> removed(
       RemoveManifestUpdate remove, Map<Long, AddSnapshotUpdate> adds,
-      CatalogState.Builder builder, int tableId) {
+      CatalogState.Builder builder, int tableId, List<SnapshotPages.BroughtBack> back) {
     AddSnapshotUpdate add = adds.get(remove.snapshotId);
     Long parent = add != null ? add.parentSnapshotId : null;
-    List<String> parentList =
-        parent != null && !adds.containsKey(parent) && builder.hasSnapshotManifests(tableId, parent)
-            ? builder.snapshotManifestPaths(tableId, parent)
-            : null;
+    List<String> parentList = null;
+    if (parent != null && !adds.containsKey(parent)) {
+      if (builder.hasSnapshotManifests(tableId, parent)) {
+        parentList = builder.snapshotManifestPaths(tableId, parent);
+      } else {
+        parentList = broughtBackList(parent, back, builder.manifestListPrefix(tableId));
+      }
+    }
     return remove.removed(parentList);
+  }
+
+  /** The manifest paths of {@code snapshotId}'s list if the update brings it back, else null. */
+  private static List<String> broughtBackList(
+      long snapshotId, List<SnapshotPages.BroughtBack> back, String prefix) {
+    for (SnapshotPages.BroughtBack brought : back) {
+      if (brought.snapshotId == snapshotId) {
+        SnapshotPages.Leaf leaf =
+            SnapshotPages.decodeLeaf(brought.leaf, prefix != null ? prefix : "");
+        if (leaf.manifests == null) {
+          return null;
+        }
+        List<String> paths = new ArrayList<>(leaf.manifests.size());
+        for (ManifestFile manifest : leaf.manifests) {
+          paths.add(manifest.path());
+        }
+        return paths;
+      }
+    }
+    return null;
   }
 
   /**
@@ -253,8 +286,9 @@ final class Landing {
    * judges that, and must make each of them stable where it admits.
    */
   static String unmergeable(
-      DecodedDelta delta, MetadataView table, CatalogState.Builder builder, int tableId) {
-    String unresolved = unresolved(delta, table, builder, tableId);
+      DecodedDelta delta, MetadataView table, CatalogState.Builder builder, int tableId,
+      List<SnapshotPages.BroughtBack> back) {
+    String unresolved = unresolved(delta, table, builder, tableId, back);
     if (unresolved != null) {
       return unresolved;
     }
@@ -363,7 +397,7 @@ final class Landing {
       for (DeltaUpdate update : delta.updates) {
         if (update instanceof RemoveManifestUpdate
             && ((RemoveManifestUpdate) update).snapshotId == first) {
-          for (String suffix : removed((RemoveManifestUpdate) update, adds, builder, tableId)) {
+          for (String suffix : removed((RemoveManifestUpdate) update, adds, builder, tableId, back)) {
             if (headList.stream().noneMatch(path -> path.endsWith(suffix))) {
               return "a manifest it removes is not in its branch's head";
             }
@@ -474,7 +508,9 @@ final class Landing {
     for (DeltaUpdate update : delta.updates) {
       if (update instanceof RemoveManifestUpdate
           && ((RemoveManifestUpdate) update).snapshotId == add.snapshotId) {
-        for (String suffix : removed((RemoveManifestUpdate) update, adds, builder, tableId)) {
+        // applied: what the update brings back is in the builder's lists by now
+        for (String suffix :
+            removed((RemoveManifestUpdate) update, adds, builder, tableId, List.of())) {
           paths.removeIf(path -> path.endsWith(suffix));
         }
       } else if (update instanceof AddManifestUpdate

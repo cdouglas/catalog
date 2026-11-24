@@ -64,6 +64,9 @@ final class TableAction {
   private final byte[] deltaBytes;
   private final List<String> readRefs;
   private DecodedDelta delta;
+  // The sealed snapshots the update brings back with their proofs (SnapshotPages.BroughtBack),
+  // inline where its delta applies
+  private List<SnapshotPages.BroughtBack> broughtBack = List.of();
 
   private TableAction(Kind kind, int tableId, int baseVersion, boolean pinned, byte[] deltaBytes,
       List<String> readRefs) {
@@ -122,6 +125,17 @@ final class TableAction {
   /** Whether the action is a read witness: a read that names the refs it read. */
   boolean readWitness() {
     return kind == Kind.READ && !readRefs.isEmpty();
+  }
+
+  /** This action, bringing {@code back} back inline before its delta applies. */
+  TableAction bringingBack(List<SnapshotPages.BroughtBack> back) {
+    this.broughtBack = List.copyOf(back);
+    return this;
+  }
+
+  /** The sealed snapshots the update brings back inline; none for most. */
+  List<SnapshotPages.BroughtBack> broughtBack() {
+    return broughtBack;
   }
 
   /** The refs a read witness read, as its record names them; none for any other action. */

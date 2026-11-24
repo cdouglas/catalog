@@ -255,6 +255,14 @@ without reading the page:
   read the manifest without its row ids. Its writer, seeing the restatement
   in its read, writes a metadata file instead, as for a list it adds that
   would restate the pool (Bug 130 (bring-back restates pooled manifest)).
+- **What the record names.** What it brings back is inline where its delta
+  applies: a new snapshot whose parent it brings back (a snapshot staged
+  on a branch the record creates at, or rolls main back to, a sealed
+  snapshot) may take that parent's extra summary entries and remove
+  manifests by their indices in its list, and replay's check that the
+  delta's references resolve reads the brought-back leaf for them, as the
+  check of what needs a sealed snapshot does (Bug 133 (bring-back parent
+  read as gone)).
 
 Any other record that needs a sealed snapshot's content conflicts with the
 same reason: a commit whose parent is sealed (a stale writer, a stale

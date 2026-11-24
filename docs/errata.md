@@ -16,7 +16,7 @@ none of them. `TestIcebergCoreIssues` asserts each is absent; on stock Iceberg
 
 An entry's ID is not reused: a finished entry is deleted and its ID retired.
 Retired: S3-S5, D1-D3, D5-D7, D9, D10, D11, D15, D17, D19, D20, D23, D24, D26, D29, T1, T2,
-T4, T5, T7, T8, U2, U3
+T4, T5, T7, T8, U2, U3, U8
 (`git log -p docs/errata.md` has each; the plans in TAIL_READS.md,
 CHECKPOINT_PLAN.md and SNAPSHOT_PAGING.md cite them by ID and summary). Five
 IDs (S2, D9, D10, T4, T5) were reused before this rule, so an older code
@@ -679,29 +679,6 @@ in the other, or does it land a rewrite on files the expiry removed, so that the
 inline catalog should refuse it? The failure's excerpt is in
 `~/work/.replays/p26-r0/diff.6.failure.txt`, and the whole log is on havoc at
 `~/data/ce-fuzz-p16g/out/p26-r0/diff.6.log.gz`.
-
-**Trigger:** the triage of the week of 2026-11-23. Replay the seed first.
-
-### U8. A paged table rejects an unraced catalog transaction (paged txn rejected unraced)
-
-Round p26-r0, shard `rebase.3`:
-`TestRebaseProperties.aMergedExpiryRemovesWhatItChoseOnItsBase`, seed
--7954634700587828010 at 198 tries (`lamport-minus-properties`, v3 partitioned,
-`COMPACT_ML`, the twin paged at block 2 and window 1). The paged twin diverged in
-the prefix, not in R. The prefix's catalog transaction (SNAPSHOT: `ROLLBACK`,
-`SET_PROPERTY`, `STAGED_APPEND`, `FAST_APPEND`) committed in the unpaged subject
-and in the reference. With nothing racing it, the twin rejected it:
-`CommitFailedException` "unresolved: the parent whose summary entries its
-snapshot takes is gone". The twin's table then ends at last-seq 6, the
-reference's at 8.
-
-A guess, unverified: the transaction rolls main back onto a snapshot the twin
-has sealed. Its append's parent is then in a page, which replay never reads. If
-so, an unraced transaction should commit, bringing the snapshot back as a ref
-moved onto a sealed snapshot does, and a rejection should at least say
-`sealed` (Bug 129 (sealed rejections misattributed)). The twin's admission
-check covers R only, so this surfaced as the end-state difference. Excerpt:
-`~/work/.replays/p26-r0/rebase.3.failure.txt`.
 
 **Trigger:** the triage of the week of 2026-11-23. Replay the seed first.
 

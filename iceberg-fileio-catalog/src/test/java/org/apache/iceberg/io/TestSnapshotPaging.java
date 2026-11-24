@@ -382,6 +382,54 @@ class TestSnapshotPaging {
   }
 
   /**
+   * Bug 133 (bring-back parent read as gone): a transaction that moves a ref onto a sealed
+   * snapshot and stages a snapshot on it brings the sealed one back with its proof, and the staged
+   * snapshot, whose parent it is, takes its parent's extra summary entries. Replay's check that
+   * a delta's references resolve read the table before the record's bring-back, so it found the
+   * parent gone and refused the record ({@code unresolved: the parent whose summary entries its
+   * snapshot takes is gone}), on its base and with nothing racing it: an unpaged catalog commits
+   * the transaction. Found by the paged twin of the rebase oracle and the paged differential
+   * (rounds p26-r0, p27-s).
+   */
+  @ParameterizedTest
+  @EnumSource(names = {"APPEND_ML", "COMPACT_ML", "CAS_TM", "MEMLOG_ML"})
+  void aTransactionStagesOnTheSealedSnapshotItBringsBack(LocalCatalogMode mode) throws Exception {
+    LogCatalog writer = mode.catalog(io, WAREHOUSE, "back", paging(4, 8));
+    writer.createNamespace(Namespace.of("ns"));
+    Table table = writer.buildTable(TABLE, SCHEMA).withPartitionSpec(SPEC).create();
+    List<Long> ids = new ArrayList<>();
+    for (int i = 0; i < 30; i++) {
+      append(table, i);
+      ids.add(table.currentSnapshot().snapshotId());
+    }
+    CatalogState state = writer.log().read().state();
+    int tblId = state.tableId(TABLE);
+    long rolledBack = ids.get(5);
+    long branched = ids.get(9);
+    assertThat(state.sealedBlockOf(tblId, rolledBack)).isNotNull();
+    assertThat(state.sealedBlockOf(tblId, branched)).isNotNull();
+
+    // main rolled back onto a sealed snapshot, and a snapshot staged on main
+    org.apache.iceberg.Transaction txn = table.newTransaction();
+    txn.manageSnapshots().rollbackTo(rolledBack).commit();
+    txn.newFastAppend().appendFile(file(100)).stageOnly().commit();
+    txn.commitTransaction();
+    // a branch created at a sealed snapshot, and a snapshot staged on it
+    txn = table.newTransaction();
+    txn.manageSnapshots().createBranch("b", branched).commit();
+    txn.newFastAppend().appendFile(file(101)).toBranch("b").stageOnly().commit();
+    txn.commitTransaction();
+
+    Table fresh = mode.catalog(io, WAREHOUSE, "back", paging(4, 8)).loadTable(TABLE);
+    assertThat(fresh.currentSnapshot().snapshotId()).isEqualTo(rolledBack);
+    assertThat(fresh.refs().get("b").snapshotId()).isEqualTo(branched);
+    List<Snapshot> staged = current(fresh).snapshots().stream()
+        .filter(s -> !ids.contains(s.snapshotId())).toList();
+    assertThat(staged).extracting(Snapshot::parentId)
+        .containsExactlyInAnyOrder(rolledBack, branched);
+  }
+
+  /**
    * A rollback to a sealed snapshot, and a tag on one, bring it back inline with its proof: the
    * table then reads as its writer committed it, through a fresh catalog, and the snapshot leaves
    * its block's live ids. A proof for another place, or a forged leaf, proves nothing.
