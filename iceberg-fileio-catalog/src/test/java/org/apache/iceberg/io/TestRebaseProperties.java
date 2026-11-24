@@ -998,8 +998,9 @@ class TestRebaseProperties {
    * <p>A merge's refusals compare as one: which one a record meets first depends on its kind, and
    * paging may change that (its full updates are smaller, so a table may stay inline where the
    * subject's moved to a metadata file and went back whole: "merge: pinned" there, a delta's
-   * refusal here; round p22-r0). For the same reason the subject may reject for the kind of its
-   * record ({@link #byKind}) where the twin admits.
+   * refusal here; round p22-r0), and so do an encoding's concerns ({@link #byClass}). For the same
+   * reason the subject may reject for the kind of its record ({@link #byKind}) where the twin
+   * admits.
    */
   private static String admission(Run unpaged, Run paged, String trace) {
     if (!unpaged.raced || !unpaged.changed) {
@@ -1033,11 +1034,18 @@ class TestRebaseProperties {
     return unpaged.conflicts == 0 ? "admitted alike" : "rejected alike";
   }
 
-  /** Rejections counted by class: a merge's refusals as one ({@link #admission}). */
+  /**
+   * Rejections counted by class: a merge's refusals as one, and an encoding's concerns as one
+   * ({@link #admission}). Which concern a rejection names first depends on the kinds of the
+   * records that landed since its base as much as merges do: a full update changes every concern,
+   * a delta only its own, and paging may keep a table inline whose records the subject sent whole
+   * (round p27-s: "concern: schema" unpaged, "concern: snapshot removal" paged, for one expiry).
+   */
   private static Map<String, Long> byClass(Map<String, Long> reasons) {
     Map<String, Long> classes = new java.util.TreeMap<>();
-    reasons.forEach((reason, count) ->
-        classes.merge(reason.startsWith("merge:") ? "merge" : reason, count, Long::sum));
+    reasons.forEach((reason, count) -> classes.merge(
+        reason.startsWith("merge:") ? "merge" : reason.startsWith("concern:") ? "concern" : reason,
+        count, Long::sum));
     return classes;
   }
 
