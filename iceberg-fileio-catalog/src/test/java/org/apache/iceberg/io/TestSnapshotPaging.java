@@ -427,6 +427,16 @@ class TestSnapshotPaging {
         .filter(s -> !ids.contains(s.snapshotId())).toList();
     assertThat(staged).extracting(Snapshot::parentId)
         .containsExactlyInAnyOrder(rolledBack, branched);
+    // Bug 135 (brought-back parent's list added twice): each staged snapshot's list is its
+    // parent's and its own manifest, once each; its writer had built it on no parent list (the
+    // parent was sealed), and replay built it on the list the record brought back
+    for (Snapshot snapshot : staged) {
+      List<String> parent = fresh.snapshot(snapshot.parentId()).allManifests(fresh.io()).stream()
+          .map(ManifestFile::path).toList();
+      List<String> list = snapshot.allManifests(fresh.io()).stream()
+          .map(ManifestFile::path).toList();
+      assertThat(list).doesNotHaveDuplicates().hasSize(parent.size() + 1).containsAll(parent);
+    }
   }
 
   /**

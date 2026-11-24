@@ -262,7 +262,10 @@ without reading the page:
   manifests by their indices in its list, and replay's check that the
   delta's references resolve reads the brought-back leaf for them, as the
   check of what needs a sealed snapshot does (Bug 133 (bring-back parent
-  read as gone)).
+  read as gone)). Its writer builds that snapshot's list on the
+  brought-back list too, as replay does, not as a whole list on a parent
+  it holds no inline list for (Bug 135 (brought-back parent's list added
+  twice)).
 
 Any other record that needs a sealed snapshot's content conflicts with the
 same reason: a commit whose parent is sealed (a stale writer, a stale

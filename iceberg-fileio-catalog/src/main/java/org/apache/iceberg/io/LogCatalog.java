@@ -2339,7 +2339,9 @@ public class LogCatalog extends BaseMetastoreViewCatalog
     /**
      * The inline list a new snapshot's list is built on: none for a snapshot without a parent, a
      * parent's this commit sends (a new one, or with {@code full}, one whose list the table has
-     * lost: Bug 68), or a parent's inline in {@code proto}. Null if the parent's list is not
+     * lost: Bug 68), a parent's inline in {@code proto}, or a sealed parent's the commit brings
+     * back ({@link #broughtBack}: a ref moves onto it), which replay holds inline before the delta
+     * applies (Bug 135 (brought-back parent's list added twice)). Null if the parent's list is not
      * inline.
      */
     private List<ManifestFile> parentList(
@@ -2357,9 +2359,14 @@ public class LogCatalog extends BaseMetastoreViewCatalog
         return parent.allManifests(io());
       }
       Integer tblId = proto != null ? proto.tableId(tableId) : null;
-      return tblId != null && proto.hasInlineManifests(tblId, parentId)
-          ? proto.inlineManifests(tblId, parentId)
-          : null;
+      if (tblId != null && proto.hasInlineManifests(tblId, parentId)) {
+        return proto.inlineManifests(tblId, parentId);
+      }
+      if (tblId != null && parent != null && proto.sealedBlockOf(tblId, parentId) != null
+          && metadata.refs().values().stream().anyMatch(ref -> ref.snapshotId() == parentId)) {
+        return parent.allManifests(io());
+      }
+      return null;
     }
 
     /**
