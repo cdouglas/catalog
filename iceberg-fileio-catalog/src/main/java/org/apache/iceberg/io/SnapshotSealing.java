@@ -118,14 +118,16 @@ final class SnapshotSealing {
   /**
    * Why a delta on table {@code tblId}, landing on {@code table}, needs a sealed snapshot's
    * content without carrying it, or null: a new snapshot whose parent is sealed (a stale writer,
-   * a stale branch); a ref moved onto a sealed snapshot; or, landing on a later version, a
-   * branch's history back to the parent it built on that reaches a sealed snapshot (the window a
-   * merging encoding reads). Blocks only become sealed, so a record rejected so where it lands
-   * would be anywhere later (S2).
+   * a stale branch); a ref moved onto a sealed snapshot; or, landing on a later version than the
+   * one it read ({@code later}), a branch's history back to the parent it built on that reaches a
+   * sealed snapshot (the window a merging encoding reads). On the version it read nothing landed
+   * after it: there is no window, and a branch the delta moves onto a snapshot built on another's
+   * head (a fast-forward) has none to walk (Bug 139 (ref move read as sealed window)). Blocks only
+   * become sealed, so a record rejected so where it lands would be anywhere later (S2).
    */
   static String reason(
       InlineDeltaCodec.DecodedDelta delta, MetadataView table, CatalogState.Builder builder,
-      int tblId, Set<Long> broughtBack) {
+      int tblId, Set<Long> broughtBack, boolean later) {
     if (delta == null || builder.sealedBlocks(tblId).isEmpty()) {
       return null;
     }
@@ -148,8 +150,8 @@ final class SnapshotSealing {
             && sealedLive(builder, tblId, table, set.snapshotId)) {
           return "sealed: ref " + set.refName + " to " + set.snapshotId;
         }
-        // The branch's history on the landing table back to what the delta built on
-        String window = window(delta, set, table, builder, tblId, added);
+        // Landing on a later version: the branch's history there back to what the delta built on
+        String window = later ? window(delta, set, table, builder, tblId, added) : null;
         if (window != null) {
           return window;
         }

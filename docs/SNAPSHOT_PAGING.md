@@ -274,7 +274,11 @@ without reading the page:
 
 Any other record that needs a sealed snapshot's content conflicts with the
 same reason: a commit whose parent is sealed (a stale writer, a stale
-branch), or a window that reaches one. This is stable (S2): blocks only
+branch), or, landing on a later version than the one it read, a window that
+reaches one. On the version it read nothing landed after it, so there is no
+window, nor for a branch the record moves onto a snapshot built on another
+branch's head (a fast-forward in the transaction that appended it) to walk
+(Bug 139 (ref move read as sealed window)). This is stable (S2): blocks only
 become sealed, so a record that conflicts where it lands would conflict
 anywhere later. The sealed reason comes before the conflict encoding's, which
 judged a table that lacked the snapshot (a merge whose parent's summary is

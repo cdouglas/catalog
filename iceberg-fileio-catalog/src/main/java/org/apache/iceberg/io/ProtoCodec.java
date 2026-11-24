@@ -3495,7 +3495,8 @@ public class ProtoCodec {
       Set<Long> back = broughtBackIds();
       if (deltaBytes != null) {
         return SnapshotSealing.reason(
-            table().delta(), ReplayView.of(builder, id).table(), builder, id, back);
+            table().delta(), ReplayView.of(builder, id).table(), builder, id, back,
+            builder.tableVersion(id) != version);
       }
       if (fullMetadata != null && headOnly) {
         Chain<Snapshot> sent =

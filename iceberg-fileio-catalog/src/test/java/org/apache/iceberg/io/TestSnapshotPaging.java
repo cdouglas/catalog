@@ -512,6 +512,55 @@ class TestSnapshotPaging {
   }
 
   /**
+   * Bug 139 (ref move read as a sealed window): a transaction that appends to main and
+   * fast-forwards a branch onto the new snapshot moves the branch onto a snapshot built on main's
+   * head, not on its own. Replay walked the branch's history on the landing table from its head
+   * back to the new snapshot's parent, the window a merging encoding reads when a record lands on
+   * a later version; on the version the record read there is no window, and from the branch's
+   * head the walk never meets main's head, which comes after it. Unpaged it ran off the root and
+   * found nothing; paged it met a sealed snapshot first and refused the record ({@code sealed:
+   * window reaches ...}), on its base and with nothing racing it, on every retry. Found by the
+   * paged twin of the rebase oracle (soak p28-s).
+   */
+  @ParameterizedTest
+  @EnumSource(names = {"APPEND_ML", "COMPACT_ML", "CAS_TM", "MEMLOG_ML"})
+  void aTransactionFastForwardingABranchOntoItsAppendCommits(LocalCatalogMode mode)
+      throws Exception {
+    LogCatalog writer = mode.catalog(io, WAREHOUSE, "forward", paging(4, 8));
+    writer.createNamespace(Namespace.of("ns"));
+    // Nothing races the commit: its first attempt must land
+    Table table = writer.buildTable(TABLE, SCHEMA).withPartitionSpec(SPEC)
+        .withProperty(org.apache.iceberg.TableProperties.COMMIT_NUM_RETRIES, "0").create();
+    List<Long> ids = new ArrayList<>();
+    for (int i = 0; i < 30; i++) {
+      append(table, i);
+      ids.add(table.currentSnapshot().snapshotId());
+    }
+    // The branch's head is inline, its parent sealed
+    CatalogState state = writer.log().read().state();
+    int tblId = state.tableId(TABLE);
+    long head = -1;
+    for (int k = 1; k < ids.size() && head < 0; k++) {
+      if (state.sealedBlockOf(tblId, ids.get(k)) == null
+          && state.sealedBlockOf(tblId, ids.get(k - 1)) != null) {
+        head = ids.get(k);
+      }
+    }
+    assertThat(head).as("an inline snapshot whose parent is sealed").isNotEqualTo(-1L);
+    table.manageSnapshots().createBranch("b", head).commit();
+
+    org.apache.iceberg.Transaction txn = table.newTransaction();
+    txn.newFastAppend().appendFile(file(100)).commit();
+    txn.manageSnapshots().fastForwardBranch("b", "main").commit();
+    txn.commitTransaction();
+
+    Table fresh = mode.catalog(io, WAREHOUSE, "forward", paging(4, 8)).loadTable(TABLE);
+    long appended = fresh.currentSnapshot().snapshotId();
+    assertThat(fresh.currentSnapshot().parentId()).isEqualTo(ids.get(ids.size() - 1));
+    assertThat(fresh.refs().get("b").snapshotId()).isEqualTo(appended);
+  }
+
+  /**
    * A rollback to a sealed snapshot, and a tag on one, bring it back inline with its proof: the
    * table then reads as its writer committed it, through a fresh catalog, and the snapshot leaves
    * its block's live ids. A proof for another place, or a forged leaf, proves nothing.

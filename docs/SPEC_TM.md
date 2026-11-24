@@ -815,7 +815,8 @@ snapshot log keeps naming them, and an expiry removes them from `live_ids`
 (a block left with none drops, and its page is garbage). A record that needs a
 sealed snapshot's content without carrying it does not apply, with reason
 `sealed: ...`: a delta whose parent is sealed, a ref moved onto a sealed
-snapshot, a branch's history back to a delta's parent that reaches one, a
+snapshot, a branch's history back to a delta's parent that reaches one (on a
+later version than the delta read: Bug 139 (ref move read as sealed window)), a
 head-only full update that holds one. A record may bring a sealed snapshot
 back inline first (a rollback, a tag on an old snapshot):
 
