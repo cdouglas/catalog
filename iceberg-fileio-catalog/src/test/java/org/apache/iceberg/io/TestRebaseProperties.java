@@ -1970,12 +1970,14 @@ class TestRebaseProperties {
       List<List<TableScript.Cmd>> steps = TableScript.steps(window);
       List<TableScript.Runner> racers =
           racers(io, mode, writers, steps.size(), merging, new StringBuilder());
+      // the inner racer made where the subject makes it (Run.of), before the window: its handle
+      // is the prefix's table, whatever the window's earlier steps changed (round p27-s, rebase.3)
+      TableScript.Runner innerRacer = inner.isEmpty() ? null
+          : new TableScript.Runner(mode.catalog(io, WAREHOUSE, "c", PROPERTIES), "wi",
+              new StringBuilder()).severalFiles(merging);
       TableMetadata afterInner = null;
       for (int i = 0; i < steps.size(); i++) {
         if (i == steps.size() - 1 && !inner.isEmpty()) { // the inner racer's commit landed first
-          TableScript.Runner innerRacer = new TableScript.Runner(
-              mode.catalog(io, WAREHOUSE, "c", PROPERTIES), "wi", new StringBuilder())
-              .severalFiles(merging);
           for (List<TableScript.Cmd> step : TableScript.steps(inner)) {
             innerRacer.run(step);
             lookAtClock();
