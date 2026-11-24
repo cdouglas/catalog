@@ -164,9 +164,10 @@ inline list (empty for none). On apply:
   which the pool keeps, and a path an update adds more than once with
   one entry each time; an update (a delta, or the manifest updates a
   full update carries) that adds one with another entry does not apply
-  (`pool: restates a pooled manifest`). Writers never send one: an
-  entry Iceberg would restate, a first row id the first v3 commit gives
-  a kept manifest, evicts the table instead (the restate rule below),
+  (`pool: restates a pooled manifest`). Writers never send one: a
+  commit whose lists give a path another entry than the pool's, or two
+  entries, in any field (a first row id the first v3 commit gives a
+  kept manifest), evicts the table instead (the restate rule below),
   and a delta merged on a later version adds no path the table holds
   (SPEC_TM.md §"Late-bound fields").
 - `RemoveManifestDelta` removes the path from the snapshot's reference
@@ -304,9 +305,13 @@ that lists it. The first snapshot of a table upgraded to v3 lists the
 data manifests it keeps with first row ids they did not have before
 (v3 spec: every data manifest in a v3 snapshot's list has one), so its
 entries differ from the pooled ones; replacing those would change the
-lists of the snapshots before it (design.md I3a). Such a commit writes
-a metadata file, which holds each snapshot's list as it is, and the
-table returns inline with a later update that fits in full.
+lists of the snapshots before it (design.md I3a). Such a commit, and
+any whose lists give a path another entry than the pool's or than
+another list of the commit (a retried transaction's two snapshots
+naming one manifest at different sequence numbers, before C36 was
+fixed), writes a metadata file, which holds each snapshot's list as it
+is, and the table returns inline with a later update that fits in
+full.
 
 The commit does not use the deltas the sink is offered: it would have
 to find them through the table handle that received them, and a catalog

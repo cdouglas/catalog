@@ -16,7 +16,7 @@ none of them. `TestIcebergCoreIssues` asserts each is absent; on stock Iceberg
 
 An entry's ID is not reused: a finished entry is deleted and its ID retired.
 Retired: S3-S5, D1-D3, D5-D7, D9, D10, D11, D15, D17, D19, D20, D23, D24, D26, D29, T1, T2,
-T4, T5, T7, T8, U2, U3, U7, U8
+T4, T5, T7, T8, U2, U3, U7, U8, U9
 (`git log -p docs/errata.md` has each; the plans in TAIL_READS.md,
 CHECKPOINT_PLAN.md and SNAPSHOT_PAGING.md cite them by ID and summary). Five
 IDs (S2, D9, D10, T4, T5) were reused before this rule, so an older code
@@ -660,20 +660,3 @@ measured at E1's and E3's points on `s3x-2026-11`. Still to take:
   Iceberg's retry, whose longer backoff throttled the writers).
 
 **Trigger:** before the paper's cloud runs.
-
-### U9. A record may name one manifest path twice with different entries (record restates pooled path)
-
-This was found while chasing C36 (retry keeps stale manifest seqs), round p26-r0
-`rebase.4`. The subject merged a retried transaction's record whose two
-snapshots named one manifest path with different sequence numbers.
-`ProtoCodec.restatesPooledManifest` checks a record's manifests only against
-the pool before the record, so the second mention passes.
-`CatalogState.Builder.addManifestToPool` then throws `ReplayCheckError` under
-the pool check (surefire, the fuzzers). Without the check, it overwrites the
-pool's entry, so the first snapshot's list reads the manifest at the second's
-numbers. With C36 fixed, no writer we know of sends such a record. Replay should
-still refuse it deterministically (`pool: restates a pooled manifest`), and the
-writer should evict the table as it does for a restated manifest. Write the
-regression test first.
-
-**Trigger:** the triage of the week of 2026-11-23.

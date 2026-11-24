@@ -2260,11 +2260,14 @@ public class LogCatalog extends BaseMetastoreViewCatalog
     }
 
     /**
-     * Whether a snapshot {@code metadata} adds lists a manifest with another first row id than
-     * the table's inline lists, or an earlier new snapshot, hold for its path: the first snapshot
-     * of a table upgraded to v3, which gives row ids to the data manifests it keeps. The inline
-     * lists share one entry per path, and changing it would change the lists that hold it (design.md
-     * I3a), so the commit writes a metadata file, which holds each snapshot's list as it is.
+     * Whether a list the commit of {@code metadata} sends names a manifest with another entry than
+     * the table's pool, or another list it sends, holds for its path, in any field replay compares
+     * ({@link CatalogState.Builder#samePoolEntry}): the first snapshot of a table upgraded to v3,
+     * which gives row ids to the data manifests it keeps, or two snapshots naming one manifest at
+     * different sequence numbers (Bug 137 (writer compared only row ids)). The inline lists share
+     * one entry per path, and changing it would change the lists that hold it (design.md I3a);
+     * replay refuses such a record (Bug 136), so the commit writes a metadata file, which holds each
+     * snapshot's list as it is.
      */
     private boolean restatesAManifest(
         CatalogState proto,
@@ -2273,20 +2276,20 @@ public class LogCatalog extends BaseMetastoreViewCatalog
         boolean full,
         SnapshotChange change) {
       Integer tblId = proto != null ? proto.tableId(tableId) : null;
-      Map<String, Long> firstRowIds = new HashMap<>();
-      if (tblId != null) {
-        proto.manifestPool(tblId).forEach((path, m) -> firstRowIds.put(path, m.firstRowId()));
-      }
+      Map<String, ManifestFile> pool = tblId != null ? proto.manifestPool(tblId) : Map.of();
+      Map<String, ManifestFile> named = new HashMap<>();
       for (Snapshot snapshot : sendCandidates(metadata, full, change)) {
         if (!sendsList(snapshot, proto, base, full, change)) {
           continue;
         }
         for (ManifestFile m : snapshot.allManifests(io())) {
-          if (firstRowIds.containsKey(m.path())
-              && !java.util.Objects.equals(firstRowIds.get(m.path()), m.firstRowId())) {
+          ManifestFile earlier = named.putIfAbsent(m.path(), m);
+          if (earlier == null) {
+            earlier = pool.get(m.path());
+          }
+          if (earlier != null && earlier != m && !CatalogState.Builder.samePoolEntry(earlier, m)) {
             return true;
           }
-          firstRowIds.put(m.path(), m.firstRowId());
         }
       }
       return false;

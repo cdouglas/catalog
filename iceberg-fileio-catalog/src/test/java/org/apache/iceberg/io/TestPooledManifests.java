@@ -182,6 +182,48 @@ class TestPooledManifests {
     assertThat(after.manifestPool(tblId)).doesNotContainKey(path);
   }
 
+  /**
+   * A writer whose commit's lists name one manifest path with two entries (errata U9) writes a
+   * metadata file, as for a list that would restate a pooled entry, rather than send a record that
+   * replay refuses on every retry: each list file holds its own entry.
+   */
+  @Test
+  void aCommitWhoseListsNameAManifestTwiceWithDifferentEntriesWritesAMetadataFile() {
+    LogCatalog catalog = LocalCatalogMode.APPEND_ML.catalog(io, "mem:///w", "c", Map.of());
+    org.apache.iceberg.TableOperations ops =
+        ((HasTableOperations) catalog.loadTable(id)).operations();
+    TableMetadata current = ops.current();
+    String path = current.location() + "/metadata/twice-m0.avro";
+    List<ManifestFile> headList = current.currentSnapshot().allManifests(io);
+    long seq = current.lastSequenceNumber();
+    TableMetadata metadata = TableMetadata.buildFrom(current)
+        .setBranchSnapshot(inlineSnapshot(33L, seq + 1, newManifest(path, seq + 1), headList),
+            "main")
+        .setBranchSnapshot(inlineSnapshot(34L, seq + 2, newManifest(path, seq + 2), headList),
+            "b")
+        .build();
+
+    ops.commit(current, metadata);
+
+    Table table = LocalCatalogMode.APPEND_ML.catalog(io, "mem:///w", "c", Map.of()).loadTable(id);
+    assertThat(((HasTableOperations) table).operations().current().metadataFileLocation())
+        .as("the table is in a metadata file")
+        .doesNotStartWith("inline:");
+    assertThat(table.snapshot(33L).allManifests(io).get(0).sequenceNumber()).isEqualTo(seq + 1);
+    assertThat(table.snapshot(34L).allManifests(io).get(0).sequenceNumber()).isEqualTo(seq + 2);
+    assertThat(rejectedInTheLog()).isEmpty();
+  }
+
+  private org.apache.iceberg.Snapshot inlineSnapshot(
+      long snapshotId, long seq, ManifestFile first, List<ManifestFile> rest) {
+    List<ManifestFile> manifests = new ArrayList<>();
+    manifests.add(first);
+    manifests.addAll(rest);
+    return new org.apache.iceberg.InlineSnapshot(
+        seq, snapshotId, head, base.lastUpdatedMillis() + snapshotId, "append",
+        Map.of("operation", "append"), base.currentSchemaId(), null, null, null, manifests);
+  }
+
   /** A data manifest at {@code path} the head's snapshot added, at sequence number {@code seq}. */
   private ManifestFile newManifest(String path, long seq) {
     return InlineDeltaCodec.manifestFile(pooled, path, seq, seq, pooled.firstRowId());
