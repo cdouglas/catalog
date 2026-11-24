@@ -320,6 +320,7 @@ final class Landing {
         }
       }
     }
+    Set<Long> chained = chained(delta, adds);
     for (AddSnapshotUpdate add : adds.values()) {
       if (table.snapshot(add.snapshotId) != null) {
         return "its snapshot id is in the table already";
@@ -331,11 +332,14 @@ final class Landing {
           && (moved || landing.parents.containsKey(add.snapshotId))) {
         return "its manifest list is a file, written for its base";
       }
-      if (!branches.containsKey(first(add.snapshotId, adds))) {
+      if (!chained.contains(add.snapshotId)) {
         // A staged snapshot: its record names no branch, and Iceberg stages it on its producer's
         // (its parent that branch's head, main's if the table lacks it; its totals counted from
         // that head, from 0 if it has none), which a table changed since may have moved, or main
-        // alone (Bug 132 (staged snapshot merged as main's))
+        // alone (Bug 132 (staged snapshot merged as main's)). One whose parent is another new
+        // snapshot of the record, a transaction's append main moves to, is on no chain either:
+        // its parent says nothing of the branch it was staged on (Bug 134 (staged snapshot on new
+        // parent merged))
         return "it stages a snapshot, whose branch it does not name";
       }
     }
@@ -676,6 +680,24 @@ final class Landing {
   private static Long latest(MetadataView table, String branch) {
     SnapshotRef ref = table.ref(branch);
     return ref != null ? Long.valueOf(ref.snapshotId()) : currentSnapshotId(table);
+  }
+
+  /**
+   * The new snapshots on the chains the delta moves refs to: each ref's new snapshot and its new
+   * ancestors. A new snapshot on none is staged.
+   */
+  private static Set<Long> chained(DecodedDelta delta, Map<Long, AddSnapshotUpdate> adds) {
+    Set<Long> chained = new HashSet<>();
+    for (DeltaUpdate update : delta.updates) {
+      if (!(update instanceof SetSnapshotRefUpdate)) {
+        continue;
+      }
+      Long id = ((SetSnapshotRefUpdate) update).snapshotId;
+      while (id != null && adds.containsKey(id) && chained.add(id)) {
+        id = adds.get(id).parentSnapshotId;
+      }
+    }
+    return chained;
   }
 
   /** The first new snapshot of the chain that ends at {@code snapshotId}. */

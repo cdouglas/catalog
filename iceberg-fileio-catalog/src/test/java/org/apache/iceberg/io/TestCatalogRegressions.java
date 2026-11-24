@@ -9195,6 +9195,33 @@ public class TestCatalogRegressions {
           cmd(TableScript.Kind.STAGED_APPEND, 0, 2, 0));
     }
 
+    /**
+     * Bug 134 (staged snapshot on new parent merged): a table transaction appends, then stages a
+     * snapshot on a branch the table lacks, whose parent is then the transaction's own append
+     * (main's head); the merge's check of a staged snapshot looked for a chain no branch starts,
+     * and this one's chain starts at the append main moves to, so the record merged past a
+     * property set, its staged snapshot's totals counted from the append's, not from 0 as Iceberg
+     * counts them (the staged branch has no head). Found by the rebase oracle's transaction
+     * property (round p27-s).
+     */
+    @Test
+    void stagedInATransactionOnItsOwnAppend() {
+      List<TableScript.Cmd> transaction = List.of(cmd(TableScript.Kind.TRANSACTION, 1, 0, 0),
+          cmd(TableScript.Kind.FAST_APPEND, 0, 0, 0),
+          cmd(TableScript.Kind.STAGED_APPEND, 0, 2, 0),
+          cmd(TableScript.Kind.FAST_APPEND, 0, 0, 0));
+      for (String encoding : List.of(LamportMinusPropertiesEncoding.NAME, ManifestWindowEncoding.NAME,
+          ConcernVectorEncoding.NAME, BlindAppendEncoding.NAME, PartitionVectorEncoding.NAME)) {
+        for (int version = 2; version <= 3; version++) {
+          for (boolean pinned : new boolean[] {true, false}) {
+            TestRebaseProperties.verifyStep(encoding, version, false, LocalCatalogMode.COMPACT_ML,
+                pinned, false, List.of(), List.of(cmd(TableScript.Kind.FAST_APPEND, 0, 0, 0)),
+                List.of(cmd(TableScript.Kind.SET_PROPERTY, 0, 0, 0)), transaction, null);
+          }
+        }
+      }
+    }
+
     @Test
     void stagedOnABranchAnAppendAdvances() {
       // b0 created at main's head; an append to b0 races the snapshot staged on it

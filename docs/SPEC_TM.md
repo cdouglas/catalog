@@ -646,9 +646,12 @@ no inline list or which removes a manifest the new parent does not list,
 adds a snapshot whose parent has no inline list where it lands (replay
 builds its list on that one, and the delta's manifests are relative to the
 list its writer read, which an eviction since wrote to a file and dropped:
-Bug 79), stages a snapshot (its record names no branch, and Iceberg stages
-on its producer's, whose head, or main's if it has none, is the parent:
-Bug 132 (staged snapshot merged as main's)), puts a snapshot with no
+Bug 79), stages a snapshot (a new snapshot that no ref the record moves
+reaches, its parent another new snapshot of the record or not: its record
+names no branch, and Iceberg stages on its producer's, whose head, or
+main's if it has none, is the parent, its totals counted from that head:
+Bug 132 (staged snapshot merged as main's), Bug 134 (staged snapshot on
+new parent merged)), puts a snapshot with no
 parent on a branch that has a head (a replace transaction's snapshot starts
 a fresh history, and its delta, which carries refs' final values and no ref
 removal, reads like the first append of an empty table: Bug 73), or lands
