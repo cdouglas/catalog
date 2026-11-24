@@ -548,8 +548,12 @@ BeginNested(w) ==
 
 \* FileIOCatalog restages an operation whose commit failed on a fresh read
 \* (commitOnAFreshRead; Iceberg's table commit retries likewise): with tail
-\* reads, of what follows the replica the failed commit held.
-RestageViews(s) == IF TailReads /\ s.base # None THEN TailViews(s.base, s.cur, None) ELSE {LiveR}
+\* reads, of what follows the replica the failed commit held. The read
+\* watches no record: the failed commit's verdict on its own (`out`) is not
+\* the new transaction's, whose id is new.
+RestageViews(s) ==
+  IF TailReads /\ s.base # None THEN TailViews([s.base EXCEPT !.out = "unseen"], s.cur, None)
+  ELSE {LiveR}
 Restage(w, fk) ==
   LET s == ws[w] IN
   /\ CanStep(w) /\ s.pc = "restage"
