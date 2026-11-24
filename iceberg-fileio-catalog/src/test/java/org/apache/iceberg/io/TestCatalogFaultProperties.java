@@ -4289,11 +4289,18 @@ class TestCatalogFaultProperties {
           // transaction loaded it and is the same inline table now (LogCatalog.stageJudged);
           // unless it is the first snapshot of a table upgraded to v3, which gives row ids to the
           // data manifests it keeps from before the upgrade: a writer that inlines manifest lists
-          // writes a metadata file for it (Bug 36), which applies only on the version it read
+          // writes a metadata file for it (Bug 36), which applies only on the version it read.
+          // Nor if the table was upgraded to v3 since the transaction loaded it: its snapshot,
+          // built without row lineage, keeps manifests without row ids, which a v3 snapshot's
+          // list may have pooled since with them, and a writer that inlines manifest lists then
+          // writes a metadata file for it too (the pool rule: Bug 137). Sent, replay would refuse
+          // it as well: the upgrade is a concern, and Landing merges no snapshot built without
+          // row lineage onto a v3 table
           int[] then = LogCatalog.inlineVersion(at.metadataLocation);
           int[] since = LogCatalog.inlineVersion(now.metadataLocation);
+          boolean upgradedSince = at.metadata.formatVersion() < 3 && now.formatVersion >= 3;
           judged &= !at.updated || then != null && since != null && then[0] == since[0]
-              && !(w.inlineLists && givesRowIds(at.metadata));
+              && !(w.inlineLists && (givesRowIds(at.metadata) || upgradedSince));
           judged &= at.updated || !at.changed && at.scans.isEmpty() && !at.declared
               || Objects.equals(now.metadataLocation, at.metadataLocation);
           // A read of it (a scan, or a declared read), updated or not, is checked at the commit's
