@@ -110,7 +110,7 @@ Fork column is `atomicio`, which sits on
 | C8. A DV older than its data file leaves the table unplannable | fixed, `core-fixes` 1d46241 | yes | yes | not reported; maintainers oppose fixing it in planning (see C8) |
 | C9. A create-or-replace replaces a table created since it began | fixed, `core-fixes` b7a2abd | yes | yes | not reported; PR [#16943](https://github.com/apache/iceberg/pull/16943) would change it (see C9) |
 | C10. An expiry that retries fails on what its first attempt removed | fixed, `core-fixes` 8900018 | yes | yes | not reported |
-| C11. An append commits files of a spec another writer removed | fixed, `core-fixes` 69e83ef | yes | yes | not reported |
+| C11. An append commits files of a spec another writer removed | fixed, `core-fixes` 69e83ef, a98495281a | yes | yes | not reported |
 | C12. An expiry follows the GC and retention settings of when it was created | fixed, `core-fixes` 0824e0d | yes | yes | `gc.enabled`: PR [#17791](https://github.com/apache/iceberg/pull/17791), open; retention: not reported |
 | C13. An expiry that committed reports a failure when its cleanup fails | fixed, `core-fixes` 7f3708a, 078b3c69b4 | yes | yes | not reported |
 | C14. A cherry-pick of a snapshot expired since it was picked fails with an NPE | fixed, `core-fixes` b1f2e01 | yes | yes | not reported |
@@ -492,12 +492,16 @@ scan can read. An appended manifest of the spec was committed as it was.
   `ValidationException` when its metadata lacks the spec of a file it
   writes (`SnapshotProducer.specForNewFiles`) or of a manifest of the new
   snapshot. Its tests are in `TestFastAppend`, `TestMergeAppend` and
-  `TestRowDelta` (`*ConcurrentSpecRemoval`). On a REST catalog the window
-  between the client's attempt and the server's commit stays open (see
-  C11.md).
+  `TestRowDelta` (`*ConcurrentSpecRemoval`). A follow-up, a98495281a,
+  looks up each deletion vector's spec before C26's check of concurrent
+  deletion vectors reads it (a v3 row delta after a replace and an expiry
+  failed there with a `NullPointerException`; soak p27-s). On a REST
+  catalog the window between the client's attempt and the server's commit
+  stays open (see C11.md).
 - **No workaround** to remove: the fuzzer counted the exception as
   unexpected.
-- **Canary:** `anAppendNeverCommitsFilesOfARemovedSpec`.
+- **Canary:** `anAppendNeverCommitsFilesOfARemovedSpec`, and
+  `aDeletionVectorOfARemovedSpecFailsCleanly` for the follow-up.
 
 ### C12. An expiry follows the GC and retention settings its table had when it was created
 

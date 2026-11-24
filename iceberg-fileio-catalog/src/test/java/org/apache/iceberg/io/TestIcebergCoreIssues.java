@@ -589,6 +589,36 @@ class TestIcebergCoreIssues {
   }
 
   /**
+   * C11's follow-up. A deletion vector of a spec another writer removed must fail its commit
+   * cleanly: C26's check of concurrent deletion vectors looked its spec up before C11's check, and
+   * failed with a NullPointerException. A replace leaves the old spec unused, so the history
+   * checks pass.
+   */
+  @Test
+  void aDeletionVectorOfARemovedSpecFailsCleanly() {
+    InMemoryCatalog catalog = catalog();
+    Table table =
+        catalog.buildTable(ID, SCHEMA).withProperty(TableProperties.FORMAT_VERSION, "3").create();
+    DataFile a = file("a");
+    table.newFastAppend().appendFile(a).commit();
+    org.apache.iceberg.RowDelta delta = table.newRowDelta().addDeletes(dv(table, a, "dv"));
+
+    Table other = catalog.loadTable(ID);
+    other.updateSpec().addField("id").commit();
+    catalog.buildTable(ID, SCHEMA).withPartitionSpec(other.spec()).replaceTransaction()
+        .commitTransaction();
+    other.refresh();
+    other.expireSnapshots().expireOlderThan(Long.MAX_VALUE).retainLast(1)
+        .cleanExpiredMetadata(true).commit();
+    other.newFastAppend().appendFile(file(other.spec(), "b")).commit();
+    assertThat(other.specs()).doesNotContainKey(a.specId());
+
+    assertThat(catchThrowable(delta::commit))
+        .as(BACK, "C11")
+        .isNotInstanceOf(NullPointerException.class);
+  }
+
+  /**
    * C19. A sort order replaced after another writer renamed its column must not fail with a
    * NullPointerException: the metadata builder looked the column up by its old name.
    */
