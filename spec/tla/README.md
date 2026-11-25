@@ -197,18 +197,10 @@ expected to pass; the rest are bug switches, each expected to break a
 property.
 
 The state counts in this file are of the models at fileio 176463d
-(2026-11-24, TLC at six workers on havoc), but for some counted at an earlier
-commit whose changes since do not reach them:
-
-- `after-skew`, `after-page-faults`, `after-page-probe` and
-  `after-resend-page-gc` at 3d66e32. The file model's changes since then are
-  restaging (operations that retry) and the sweep of the state's pages
-  (`SealEvery` above 0), and these four have neither. Of the 80 passing
-  configurations counted at both commits, only `statepages`,
-  `after-statepages` and `after-sched-fault` differ.
-- The `log-*` configurations at 0434a89, and `sg-compact-ahead` and
-  `sg-copies-faults` at 864eb4f: `SharedLogCommit.tla` and `SegmentedLog.tla`
-  have not changed since.
+(2026-11-24 and 25, TLC at six workers on havoc), but for the `log-*`
+configurations, counted at 0434a89, and `sg-compact-ahead` and
+`sg-copies-faults`, counted at 864eb4f: `SharedLogCommit.tla` and
+`SegmentedLog.tla` have not changed since.
 
 A passing configuration's count is the number of states it reaches, whatever
 the workers. A bug switch's run stops at its first violation, and how many
