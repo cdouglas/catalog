@@ -1,7 +1,7 @@
 # TLA+ models of the commit protocol
 
-Two models of the commit loop (`LogRuntime.commit`, formerly
-`ProtoCatalogFormat.Mut.commit`) over one replicated state machine (`RSM.tla`):
+Two models of the commit loop (`LogRuntime.commit`) over one replicated state
+machine (`RSM.tla`), and one of a log below it:
 
 - `CatalogCommit.tla`: one catalog object in storage with conditional writes
   (`AtomicFileLog`). `CatalogOracles.tla` states the jqwik fuzzers' oracles as
@@ -14,6 +14,9 @@ Two models of the commit loop (`LogRuntime.commit`, formerly
   (Kafka, SQS, a ledger, `InMemorySharedLog`). It was written before the Java it
   validates, to say what that Java must do; see
   [The shared-log model](#the-shared-log-model).
+- `SegmentedLog.tla`: the segmented log on Azure Append Blobs (`SegmentedLog`),
+  below the SPI that the shared-log model takes as one log; see
+  [The segmented log](#the-segmented-log).
 
 Both models also page the committed set as `docs/COMMITTED_PAGING.md` designs it:
 the floor, PageOut records, page puts and sweeps. That part was written before
@@ -65,11 +68,13 @@ java -cp tools/tla2tools.jar tlc2.TLC -workers 2 -config states/cfg/log-mix.cfg 
 ```
 
 `TLC_WORKERS` (default 2) and `TLC_HEAP` (default 2g) size the runs. Checked with
-TLC 2026.10.13.164326 (rev 210df3a), the version that jar reported. A full
-run took about six hours on the dev box at 4c685a3 ("Results"). Most
-configurations take seconds; `mix`,
-`mix-lenient`, `skew`, `log-mix` and `log-missingfail` take 3 to 6 minutes
-each, and `log-three` 8 to 11.
+TLC 2026.10.13.164326 (rev 210df3a), the version that jar reported. Every
+configuration together takes about 16 hours at six workers. Most take seconds.
+`after-skew` takes about five hours and `sg-compact-ahead` four;
+`after-resend-page-gc`, `after-page-probe`, `after-page-gc`, `after-page-faults`
+and `after-faults2` 20 minutes to an hour each (times of 2026-11-24, on havoc);
+`log-reads`, `log-view-freed-gc`, `skew`, `sg-copies-faults`, `mix-lenient` and a
+dozen more 5 to 15 minutes. Run the large ones apart (`-n`), with more workers.
 
 ## The file model
 
@@ -182,31 +187,54 @@ goes in a replace, `oversized` in `mustReplace`: Bug 71, covered by
 | `HistGrows` (action) | the history only grows, one transaction at a time |
 | `CasAppliesItsRecord` (action) | a CAS applies its own record when the record holds on the checkpoint it wrote |
 | `CheckpointIsReplay` (action) | a CAS's checkpoint is the replay of the version it replaces: a function of the log, not of its writer's clock (I11) |
+| `Termination` (liveness) | every writer finishes its operations, under `FairSpec`: writers keep stepping, and faults run out (`base-live`, `page-live`, `after-two-each-live`) |
 
 ## Results
 
 Every configuration of the correct protocol passes. `check.py` holds 225
 configurations (129 of the file model, 72 `log-*`, 24 `sg-*`), 144 of them
 expected to pass; the rest are bug switches, each expected to break a
-property. The state counts in this file's tables are from `check.py`'s full
-run at 4c685a3 (2026-11-11: the 138 configurations it held then, about six
-hours on the dev box), unless a table gives its own date:
+property.
+
+The state counts in this file are of the models at fileio 176463d
+(2026-11-24, TLC at six workers on havoc), but for some counted at an earlier
+commit whose changes since do not reach them:
+
+- `after-skew`, `after-page-faults`, `after-page-probe` and
+  `after-resend-page-gc` at 3d66e32. The file model's changes since then are
+  restaging (operations that retry) and the sweep of the state's pages
+  (`SealEvery` above 0), and these four have neither. Of the 80 passing
+  configurations counted at both commits, only `statepages`,
+  `after-statepages` and `after-sched-fault` differ.
+- The `log-*` configurations at 0434a89, and `sg-compact-ahead` and
+  `sg-copies-faults` at 864eb4f: `SharedLogCommit.tla` and `SegmentedLog.tla`
+  have not changed since.
+
+A passing configuration's count is the number of states it reaches, whatever
+the workers. A bug switch's run stops at its first violation, and how many
+states it has reached by then varies with the workers, so this file gives no
+count for one.
 
 | Config | What it adds | States |
 |---|---|---|
 | `base` | two writers contending; append, then compaction by count | 61 |
+| `base-live` | `base` under `FairSpec`, checking `Termination` (the 2026-11-17 review's F8) | 61 |
 | `cas-only`, `gcs`, `size` | max.append.count 0; no append support; compaction by size | 55, 55, 61 |
 | `two-each`, `long` | several transactions per writer: compaction racing appends, the shrink path | 953, 542 |
 | `creates` | creates in different namespaces | 61 |
-| `faults`, `faults-strict`, `faults2` | every fault, late landings included; strict versions; two faults | 558; 639; 104,218 |
-| `gc0`, `skew` | retention 0; a writer's clock behind by more than the retention | 21,777; 603,529 |
+| `faults`, `faults-strict`, `faults2` | every fault, late landings included; strict versions; two faults | 558; 558; 88,007 |
+| `gc0`, `gc2`, `skew` | retention 0; retention 2 over three ticks, so the horizon trails a retention behind (F4); a writer's clock behind by more than the retention | 21,789; 87,917; 604,420 |
 | `seg` | a segment cap below max.append.count | 77 |
-| `mix`, `mix-lenient` | everything at once | 349,273; 584,711 |
-| `long-faults`, `three` | faults with the shrink path; three writers | 53,032; 43,118 |
-| `sched-*` | each fuzzer's schedules | 23 to 6,882 |
-| `concerns`, `concerns-faults` | conflict encodings: a table's concerns as entities (below); with every fault | 1,995; 11,071 |
+| `mix`, `mix-lenient` | everything at once | 287,984; 606,843 |
+| `long-faults`, `three` | faults with the shrink path; three writers | 43,440; 29,878 |
+| `sched-*` | each fuzzer's schedules | 23 to 6,626 |
+| `concerns`, `concerns-faults` | conflict encodings: a table's concerns as entities (below); with every fault | 1,995; 9,435 |
 | `blind-appends` | two blind appends, with every fault | 577 |
 | `validated` | three validated commits on partitions (below) | 2,079 |
+
+`faults-strict` reaches what `faults` does: a read through a write reads
+nothing ([Tail reads](#tail-reads)), so no read of these schedules meets a
+strict read's refusal.
 
 **Conflict encodings.** A conflict encoding (fileio-catalog's
 `ConflictEncoding`) versions a table by its concerns. In the model the
@@ -298,9 +326,12 @@ as their configurations `bug26` and `bug64a` do.
 | 66 | caught | **missed** | not drawn (no segment cap) |
 | 64b | **missed** | **missed** | **missed** |
 | 64c | **missed** (needs clock skew) | **missed** (needs clock skew) | unreachable |
+| `noretention` | **missed** | **missed** | **missed** (race1: unreachable) |
 
 On the correct model, every oracle passes on every schedule. `Adequate` holds
-everywhere except the missed cells.
+everywhere except the missed cells. No oracle compares the horizon with the
+retention, so `noretention`, whose outcomes are each unknown or failed with the
+id crossed, passes all three.
 
 ### What the model found
 
@@ -488,8 +519,8 @@ Every configuration of the correct protocol passes:
 | `log-reads`, `log-reads-faults` | catalogs' reads outside a commit (`Look`), with compaction and lagging reads; with every fault | 2,430,667; 15,013 |
 | `log-inflight2-gc` | two appends in flight, landing late around compaction (as a segmented log's append waits behind an open segment and lands later with no fault) | 1,780,124 |
 
-The `log-cond*`, `log-void*`, `log-reads*` and `log-inflight2-gc` counts are of
-2026-11-20 (the review's F7 and F3).
+The state's pages have their own configurations
+([The state's pages](#the-states-pages)).
 
 **Coverage.** `check.py --witnesses` reaches, in the passing configurations:
 
@@ -512,8 +543,9 @@ The `log-cond*`, `log-void*`, `log-reads*` and `log-inflight2-gc` counts are of
 
 Each switch puts back a mistake this kind of log admits. The first five were
 planned with the model; the next three are what the model found (below);
-the last four came with conditional and void appends and reads outside a
-commit (the 2026-11-17 review's F7):
+`basever` is the file model's; the last four came with conditional and void
+appends and reads outside a commit (the 2026-11-17 review's F7). The state's
+pages have three more ([The state's pages](#the-states-pages)):
 
 | Switch | What it does | Caught by |
 |---|---|---|
@@ -663,7 +695,7 @@ configuration). An id's block is the largest node that holds it and at most
 `BlockIds` (N) inline ids. The blocks are computed from `C`, not stored: that
 is the design's claim that any two replicas at one position agree. The oldest
 block is the oldest id's. The configurations use N = 1, and N = 2 in
-`log-page-n2`.
+`page-n2` and `log-page-n2`.
 
 **Records.**
 
@@ -704,10 +736,13 @@ digest, so a page is its name. A page is put before its PageOut is sent:
   tops are at or below `min(clock − A, own stamp − 1)`. `PrepCas` fixes the
   payload and puts its pages, one step before the CAS (`Write`). After a put
   fault, the CAS goes without its PageOuts.
-- **Sweeps.** `Sweep` (any compactor, on any read) deletes every page its read
-  does not reference whose node ends at or below its floor. Deleting the pages
-  a GC record dropped, once it has landed, is a sweep on a read through it, so
-  it is not a separate action.
+- **Sweeps.** `Sweep` (any compactor, `LogRuntime.sweep(replica)`) deletes
+  every page its read does not reference whose node ends at or below its
+  floor. On the shared log it sweeps from any read; on the file, from the live
+  object or from a replica a writer holds, however stale (the snapshot it
+  staged on, the replica it holds). Deleting the pages a GC record dropped,
+  once it has landed, is a sweep on a read through it, so it is not a separate
+  action.
 
 ### Actions and code
 
@@ -744,11 +779,14 @@ Every configuration of the correct design passes:
 
 | Config | What it adds | States |
 |---|---|---|
-| `page` | two transactions each, a tick, a CAS that pages, one sweep | 8,185 |
-| `page-cas` | CAS only, two ticks | 23,654 |
-| `page-gc` | retention 2, three ticks: pages that GC later drops, and the sweep that deletes them | 138,132 |
-| `page-faults` | every fault, page faults included, strict versions | 126,770 |
-| `page-skew` | a writer's clock ahead by 2: the other mints after a floor above its clock | 7,995 |
+| `page` | two transactions each, a tick, a CAS that pages, one sweep | 8,189 |
+| `page-live` | `page` under `FairSpec`, checking `Termination` (the 2026-11-17 review's F8) | 8,189 |
+| `page-cas` | CAS only, two ticks | 23,674 |
+| `page-gc` | retention 2, three ticks: pages that GC later drops, and the sweep that deletes them | 138,772 |
+| `page-faults` | every fault, page faults included, strict versions | 109,485 |
+| `page-skew` | a writer's clock ahead by 2: the other mints after a floor above its clock | 8,007 |
+| `page-probe` | the probe path (tail reads off) with one fault (F1; its copy below the floor needs compaction after the commit: `after-page-probe`) | 143,790 |
+| `page-n2`, `page-admit`, `page-three` | blocks of two ids; an admission window of 1 over three ticks; three writers (F9) | 30,216; 83,803; 17,600 |
 | `log-page`, `log-page2` | two transactions each; one page put (its PageOut sent, or never) and one sweep; two pages | 10,211; 17,259 |
 | `log-page-n2` | blocks of two ids | 7,885 |
 | `log-page-gc` | one transaction each; a GC record, a checkpoint, a trim | 23,662 |
@@ -937,14 +975,14 @@ that names them. Both models have them (the shared-log model since the
   dropped: the property was too strong, not the protocol.
   `CheckpointRoundTrip.snapshotPagesProblem` checks the same in Java.
 
-| Configuration | Expect | What |
-|---|---|---|
-| `statepages` | pass | writer 1 writes `a` three times (`SealEvery` 1: seals at each version, drops one behind), CAS every commit, sweeps |
-| `statepages-faults` | pass | with a fault of any kind and strict reads: a CAS in flight, whose root names pages its `PrepCas` put, may land after a sweep |
-| `statepages-two` | pass | two transactions each (`TwoEach`): both entities' pages, swept from any replica a writer holds |
-| `after-statepages`, `after-statepages-resend` | pass | compaction after the commit, and a compaction sent again (its pages put once) |
-| `rootfirst` | `StatePagesExist` | a root written before its pages are put |
-| `sweepstale` | `StatePagesExist` | a sweep that deletes every page its (stale) view does not name, whatever version |
+| Configuration | Expect | What | States |
+|---|---|---|---|
+| `statepages` | pass | writer 1 writes `a` three times (`SealEvery` 1: seals at each version, drops one behind), CAS every commit, sweeps | 5,022 |
+| `statepages-faults` | pass | with a fault of any kind and strict reads: a CAS in flight, whose root names pages its `PrepCas` put, may land after a sweep | 72,611 |
+| `statepages-two` | pass | two transactions each (`TwoEach`): both entities' pages, swept from any replica a writer holds | 8,189 |
+| `after-statepages`, `after-statepages-resend` | pass | compaction after the commit, and a compaction sent again (its pages put once) | 132,404; 139,483 |
+| `rootfirst` | `StatePagesExist` | a root written before its pages are put | |
+| `sweepstale` | `StatePagesExist` | a sweep that deletes every page its (stale) view does not name, whatever version | |
 
 **The shared-log model.** A compactor's `PutCheckpoint` first puts the pages
 its checkpoint names that the records after the checkpoint it read from
@@ -957,14 +995,14 @@ still names, be in the store: a reader replays the records after its
 checkpoint before it loads (and one whose read lags reads again when it finds
 a page missing, as `LogCatalog`'s loads do).
 
-| Configuration | Expect | What |
-|---|---|---|
-| `log-statepages` | pass | writer 1 takes `a` to version 4 (`Long`), writer 2 writes `b`; two checkpoints, a trim, a sweep |
-| `log-statepages-lag` | pass | reads, checkpoints and sweeps through any position (`Lag`) |
-| `log-statepages-faults` | pass | one checkpoint, a fault of any kind |
-| `log-rootfirst` | `StatePagesExist` | a checkpoint stored without its pages |
-| `log-sweepnewest` | `StatePagesExist` | a sweep of every page the checkpoint stored last does not name, as if readers started from it alone: compactors may store a checkpoint behind another |
-| `log-sweepstale` | `StatePagesExist` | a sweep of every page a stale (lagging) read does not name, whatever version |
+| Configuration | Expect | What | States |
+|---|---|---|---|
+| `log-statepages` | pass | writer 1 takes `a` to version 4 (`Long`), writer 2 writes `b`; two checkpoints, a trim, a sweep | 11,816 |
+| `log-statepages-lag` | pass | reads, checkpoints and sweeps through any position (`Lag`) | 58,795 |
+| `log-statepages-faults` | pass | one checkpoint, a fault of any kind | 157,346 |
+| `log-rootfirst` | `StatePagesExist` | a checkpoint stored without its pages | |
+| `log-sweepnewest` | `StatePagesExist` | a sweep of every page the checkpoint stored last does not name, as if readers started from it alone: compactors may store a checkpoint behind another | |
+| `log-sweepstale` | `StatePagesExist` | a sweep of every page a stale (lagging) read does not name, whatever version | |
 
 ## Tail reads
 
@@ -1010,25 +1048,24 @@ without the switch the compactor reads again. `nojoint` replays it, and the
 checkpoint it stores is not the replay of the log through its position
 (`Deterministic`, `CheckpointIsReplay`).
 
-| Config | What it adds |
-|---|---|
-| `probe`, `probe-gc`, `probe-faults` | the probe path (`TailReads` FALSE): base, with GC (a replace can grow the object past a writer's version), with every fault |
-| `probe-long`, `probe-faults2`, `probe-size` | the probe path on `long`'s, `faults2`'s and `bug26`'s bounds (538; 194,865; 1,125 states, 2026-11-20) |
-| `tail-long` | tail reads with the shrink path and GC |
-| `lengthonly`, `notrailer`, `probeinc` | the switches above, on `gc0`'s bounds (`probeinc` on the probe path) |
-| `log-nojoint` | the shared log's switch, with compaction |
+| Config | What it adds | States |
+|---|---|---|
+| `probe`, `probe-gc`, `probe-faults` | the probe path (`TailReads` FALSE): base, with GC (a replace can grow the object past a writer's version), with every fault | 61; 22,193; 1,078 |
+| `probe-long`, `probe-faults2`, `probe-size` | the probe path on `long`'s, `faults2`'s and `bug26`'s bounds | 538; 168,151; 973 |
+| `tail-long` | tail reads with the shrink path and GC | 3,297 |
+| `lengthonly`, `notrailer`, `probeinc` | the switches above, on `gc0`'s bounds (`probeinc` on the probe path) | |
+| `log-nojoint` | the shared log's switch, with compaction | |
 
-Every other configuration runs with tail reads (the state counts in "Results"
-above predate them: `gc0`, for one, now has 21,777 states). Bugs 26, 64a and `floorgap`
+Every other configuration runs with tail reads. Bugs 26, 64a and `floorgap`
 need a resend after a probe without a read, so their calibrations run on the
 probe path: with tail reads the loop reads before it resends, and a read that
 puts the commit's id at or below the horizon ends it. For the same reason the
 witnesses of the probe path's states (a stale append, a file that shrank, a CAS
 after a fresh read, the last attempt's final read, the append count overshot,
 a record in the log twice) are reached only there: `probe`, `probe-gc`,
-`probe-faults`, `probe-long`, `probe-faults2` and `probe-size` (on `two-each`,
-`long`, `mix`, `faults2` and `faults`, where they were until tail reads became
-the default, nothing reaches them; found by the full witness run of 2026-11-20).
+`probe-faults`, `probe-long`, `probe-faults2` and `probe-size`. With tail
+reads, nothing reaches them on `two-each`, `long`, `mix`, `faults2` or
+`faults`.
 
 ## Compaction after the commit
 
@@ -1055,26 +1092,29 @@ replace with no intention record.
 
 Every configuration above runs with `CompactAfter` FALSE: the fused
 compaction, which `fileio.catalog.compact.after.commit` false puts back, and
-whose replace a full object still takes. Their states are as before. The
-`after-*` family runs the same kinds of schedule with compaction after the
-commit, at a count of 1 so that every commit may compact:
+whose replace a full object still takes. The `after-*` family runs the same
+kinds of schedule with compaction after the commit, at a count of 1 so that
+every commit may compact:
 
 | Config | What it adds | States |
 |---|---|---|
-| `after-base`, `after-cas-only`, `after-gcs` | two writers contending; CAS only (every commit replaces, none compacts after); no append support | 208; 55; 55 |
-| `after-size` | compaction by size (`MaxSize` 3) | 4,908 |
-| `after-two-each`, `after-long` | compactions racing appends; the shrink path | 14,985; 2,617 |
-| `after-faults`, `after-faults-strict`, `after-faults2` | every fault, late landings included (a compaction's too); strict versions; two faults | 2,167; 2,650; 2,621,932 |
-| `after-gc0`, `after-skew` | retention 0 (a compaction's GC record, with no record of its own to stay below); a clock behind by more than the retention | 267,011; 17,469,599 |
-| `after-seg` | a segment cap: a full object makes the commit replace it with its record | 3,415 |
-| `after-long-faults`, `after-three` | faults with the shrink path; three writers | 352,926; 765,928 |
-| `after-probe`, `after-probe-faults` | tail reads off, with GC; with every fault | 339,513; 4,596 |
-| `after-sched-mw`, `after-sched-fault`, `after-sched-race`, `after-sched-race-op` | each fuzzer's schedules | 48,458; 4,028; 73; 111 |
-| `after-concerns-faults`, `after-blind-appends` | conflict encodings with every fault; blind appends | 393,824; 2,415 |
-| `after-page`, `after-page-gc`, `after-page-faults`, `after-page-skew` | paging: a compaction pages up to its clock less `A`; with GC; with every fault and the page store's; skewed clocks | 128,712; 2,563,427; 3,600,508; 122,051 |
-| `after-statepages` | the state's pages, put before a compaction's root | 87,734 |
-| `after-resend`, `after-resend-three` | a compaction that lost to appends sent again, twice at most; three writers | 15,491; 24,425 |
-| `after-resend-faults`, `after-resend-gc`, `after-resend-page` | with every fault; GC at retention 0 and a clock behind; paging, a clock behind | 371,882; 341,470; 126,240 |
+| `after-base`, `after-cas-only`, `after-gcs` | two writers contending; CAS only (every commit replaces, none compacts after); no append support | 224; 55; 55 |
+| `after-size` | compaction by size (`MaxSize` 3) | 5,426 |
+| `after-two-each`, `after-long` | compactions racing appends; the shrink path | 19,690; 2,880 |
+| `after-two-each-live` | `after-two-each` under `FairSpec`, checking `Termination` (the 2026-11-17 review's F8) | 19,690 |
+| `after-faults`, `after-faults-strict`, `after-faults2` | every fault, late landings included (a compaction's too); strict versions; two faults | 2,458; 2,458; 2,824,109 |
+| `after-gc0`, `after-skew` | retention 0 (a compaction's GC record, with no record of its own to stay below); a clock behind by more than the retention | 374,751; 27,156,299 |
+| `after-seg` | a segment cap: a full object makes the commit replace it with its record | 3,516 |
+| `after-long-faults`, `after-three` | faults with the shrink path; three writers | 279,279; 456,860 |
+| `after-probe`, `after-probe-faults` | tail reads off, with GC; with every fault | 458,332; 4,242 |
+| `after-sched-mw`, `after-sched-fault`, `after-sched-race`, `after-sched-race-op` | each fuzzer's schedules | 63,176; 5,076; 73; 113 |
+| `after-concerns-faults`, `after-blind-appends` | conflict encodings with every fault; blind appends | 371,425; 2,763 |
+| `after-page`, `after-page-gc`, `after-page-faults`, `after-page-skew` | paging: a compaction pages up to its clock less `A`; with GC; with every fault and the page store's; skewed clocks | 166,407; 3,313,983; 3,125,307; 150,040 |
+| `after-page-probe` | paging on the probe path, one fault: a resend after a compaction that paged its id lands a copy only the floor rejects (F1) | 5,078,768 |
+| `after-statepages`, `after-statepages-resend` | the state's pages, put before a compaction's root; a compaction sent again, its pages put once (F5) | 132,404; 139,483 |
+| `after-resend`, `after-resend-three` | a compaction that lost to appends sent again, twice at most; three writers | 20,284; 27,716 |
+| `after-resend-faults`, `after-resend-gc`, `after-resend-page` | with every fault; GC at retention 0 and a clock behind; paging, a clock behind | 348,432; 463,816; 154,617 |
+| `after-resend-page-gc` | resends with paging and GC at retention 2 at once, a clock behind (F9) | 3,448,034 |
 
 Every one passes. A compaction that lost its race to appends may be sent again
 (`CompactRead`, `CompactResends` times: 1 in every `after-*` configuration, 2
@@ -1113,8 +1153,8 @@ compaction on the multi-writer and race schedules, a resent compaction landed
 (`Not_CompactionResent`, with GC and with paging), and one whose PageOut its
 copied records made replay refuse (`Not_ResentPageOutRefused`).
 
-The oracle matrix (`--matrix`) adds `none-after` and the three switches on
-each fuzzer's schedules:
+The oracle matrix (`--matrix`) adds `none-after` and the switches on each
+fuzzer's schedules:
 
 | Bug | `mw` | `fault` | `race`, `race1` |
 |---|---|---|---|
@@ -1122,11 +1162,16 @@ each fuzzer's schedules:
 | `compactbase` | caught | caught | caught |
 | `compactresend` | caught | unreachable | unreachable |
 | `compactfail` | caught | unreachable | unreachable |
+| `compactunknown` | caught | **missed** | unreachable |
 | `compactcopyafter` | caught | unreachable | unreachable |
 | `compactreplaced` | unreachable | unreachable | unreachable |
 
-Every cell is adequate. The fault schedules run nothing between a commit's
-first write and its end, and the race schedules no racer before a
+Every cell is adequate but `compactunknown`'s on the fault schedules: the
+fault oracle takes an unknown outcome whenever the catalog is with or without
+the operation, and its tightened version (`OracleFault2`, the Java test's
+rule: unknown only after a fault) after any fault the operation met, a
+compaction's included (`pf`). The fault schedules run nothing between a
+commit's first write and its end, and the race schedules no racer before a
 compaction, so neither loses a compaction race. The multi-writer oracle
 first missed `compactbase` and `compactresend`: it judged a commit on its own
 writes, and the damage is in the compaction's. It now also asks of each
@@ -1202,7 +1247,7 @@ Not modelled: the view `readThrough` and `readAfter` return beyond the copy's pl
 catalog object's own writes (an Install or a checkpoint replace with its reply lost), which
 the version condition should make harmless (the 2026-11-17 review's F3, items 3 and 4).
 
-**Results** (2026-11-15). Every passing configuration holds:
+**Results.** Every passing configuration holds:
 
 | Configuration | What it adds | Distinct states |
 |---|---|---:|
@@ -1215,9 +1260,9 @@ the version condition should make harmless (the 2026-11-17 review's F3, items 3 
 | `sg-compact` | a checkpoint and two sweeps, over two rotations; two reads | 308,175 |
 | `sg-faults` | one fault: lost reply, not sent, in flight, short read (of a reader's segment, or of the read-through's) | 262,970 |
 | `sg-faults-compact` | a fault, with a checkpoint and a sweep | 157,574 |
-| `sg-short` | two short reads, K = 2 in blobs of three blocks (2026-11-20) | 68,778 |
-| `sg-compact-ahead` | `sg-compact` with one record each and one read, writers taking any open segment and installing ahead (2026-11-20) | 14,943,360 |
-| `sg-copies-faults` | two copies of a record, three sends, one fault of any kind (2026-11-20) | 958,644 |
+| `sg-short` | two short reads, K = 2 in blobs of three blocks | 68,778 |
+| `sg-compact-ahead` | `sg-compact` with one record each and one read, writers taking any open segment and installing ahead | 14,943,360 |
+| `sg-copies-faults` | two copies of a record, three sends, one fault of any kind | 958,644 |
 
 The larger scenarios narrow writers' choices (`AnySeg` and `Ahead` false): with both open,
 `sg-two-each` had not finished after 15 minutes.
@@ -1279,12 +1324,12 @@ in a namespace not dropped, the entity at the version read, a namespace dropped 
 not use the removals or versions the record carries. `HonestFailed` catches the ABA: a create
 reported failed whose late copy applies once its name is freed.
 
-**Results** (2026-11-18). Every passing configuration holds:
+**Results.** Every passing configuration holds:
 
 | Config | What it adds | States |
 |---|---|---:|
 | `names` | a table and a view take one name, a.x; the view moves to b.y as a table takes that name | 357 |
-| `names-faults` | the same, with every fault | 4,298 |
+| `names-faults` | the same, with every fault | 3,858 |
 | `names-mixed` | a table's create bound by version, a view's by name, then the view's drop; every fault | 1,287 |
 | `view-nsdrop` | a view's create and its namespace's drop, staged on one read; every fault | 397 |
 | `view-updates` | two updates of a view staged on one version; every fault | 698 |
